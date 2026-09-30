@@ -17,6 +17,18 @@ race_ws/log/
 workshop/ros2_ws/build/
 workshop/ros2_ws/install/
 workshop/ros2_ws/log/
+# colcon output from building at the repo root. install/ itself holds tracked
+# setup scripts, so ignore only what colcon writes there.
+/build/
+/log/
+/install/.colcon_install_layout
+/install/COLCON_IGNORE
+/install/_local_setup_util_*.py
+/install/local_setup.*
+/install/setup.*
+/install/f1tenth_gym_ros/
+/install/my_package/
+/install/team_driver/
 
 # --- AutoDRIVE Simulator ---
 # Not used on this track. It appears here only if you have switched branches
@@ -43,3 +55,4 @@ rosbag2_*/
 
 # Written by the CI integrity step if it is ever run inside the checkout
 integrity.txt
+install/

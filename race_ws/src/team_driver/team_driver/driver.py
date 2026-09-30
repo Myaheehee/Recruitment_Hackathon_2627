@@ -59,7 +59,7 @@ class Driver(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('crawl_speed', 1.0)        # [m/s]
+        self.declare_parameter('crawl_speed', 0.0)        # [m/s]
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
 
         self.crawl_speed = self.get_parameter('crawl_speed').value
@@ -142,7 +142,7 @@ class Driver(Node):
         to use, the occupancy grid is published on /map, and nothing stops you
         subscribing to more topics, loading a line you computed offline, or
         running a policy you trained. See docs/04-algorithms.md for the
-        approaches and what each one needs.
+        approaches and what each one needs
         """
         return 0.0, self.crawl_speed
 
@@ -189,3 +189,15 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+#stopping the program and resetting car position
+
+#   Press Ctrl+C in Terminal 2. 
+#If you've lost track of where it's running, use pkill -f team_driver.
+
+#   ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped "{drive: {speed: 0.0, steering_angle: 0.0}}"
+
+#ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
+"{header: {frame_id: map}, pose: {pose: {position: {x: -1.68, y: -0.01}, orientation: {w: 1.0}}}}"
+
+#ros2 topic echo /ego_racecar/odom --no-arr
