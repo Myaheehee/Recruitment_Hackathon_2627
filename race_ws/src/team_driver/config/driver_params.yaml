@@ -15,5 +15,6 @@
 
 driver:
   ros__parameters:
-    crawl_speed: 1.0          # [m/s]; you ask for a speed and the sim holds it
+    crawl_speed: 3.0          # [m/s]; you ask for a speed and the sim holds it
     max_range: 8.0            # [m] clip the scan here
+    lookahead_distance: 1.0

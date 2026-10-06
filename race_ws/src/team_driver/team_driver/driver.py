@@ -42,6 +42,7 @@ import math
 import numpy as np
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
+from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
@@ -59,11 +60,38 @@ class Driver(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('crawl_speed', 0.0)        # [m/s]
+        self.declare_parameter('crawl_speed', 3.0)        # [m/s]
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
+        self.declare_parameter('lookahead_distance', 1.0)  # [m]
+        self.declare_parameter('wheelbase', 0.33)          # [m]
+        self.declare_parameter('max_steer', 0.4189)        # [rad]
+        self.declare_parameter('centerline_csv', '/hackathon/maps/icra26_centerline.csv')
 
         self.crawl_speed = self.get_parameter('crawl_speed').value
         self.max_range = self.get_parameter('max_range').value
+        self.lookahead_distance = self.get_parameter('lookahead_distance').value
+        self.wheelbase = self.get_parameter('wheelbase').value
+        self.max_steer = self.get_parameter('max_steer').value
+
+        # The path to follow: an (N, 2) array of x, y points in the map frame,
+        # in driving order. Lines starting with '#' are comments.
+        self.path = np.loadtxt(
+            self.get_parameter('centerline_csv').value, delimiter=',', comments='#')
+
+        # The path drawn as a closed line for RViz. It never changes, so build
+        # it once here; publish_marker() sends it along with the arrow.
+        self.path_marker = Marker()
+        self.path_marker.header.frame_id = 'map'
+        self.path_marker.ns = 'team_driver'
+        self.path_marker.id = 1
+        self.path_marker.type = Marker.LINE_STRIP
+        self.path_marker.action = Marker.ADD
+        self.path_marker.scale.x = 0.05                       # line width [m]
+        self.path_marker.color.r, self.path_marker.color.g = 1.0, 0.8
+        self.path_marker.color.a = 1.0
+        self.path_marker.pose.orientation.w = 1.0
+        for x, y in np.vstack([self.path, self.path[:1]]):   # repeat point 0 to close the loop
+            self.path_marker.points.append(Point(x=float(x), y=float(y)))
 
         # Latest known pose and speed. Ground truth from the simulator, which
         # the rules allow you to use - so use it.
@@ -144,7 +172,34 @@ class Driver(Node):
         running a policy you trained. See docs/04-algorithms.md for the
         approaches and what each one needs
         """
-        return 0.0, self.crawl_speed
+        # No odometry yet, so we don't know where we are: stay still.
+        if self.position is None:
+            return 0.0, 0.0
+
+        car = np.array(self.position)
+
+        # 1. Find the path point closest to the car.
+        distances = np.linalg.norm(self.path - car, axis=1) #distancefrom each point in path
+        i = int(np.argmin(distances))
+
+        # 2. Walk forward along the path until a point is at least one
+        #    lookahead distance away. The % wraps round at the end of the lap.
+        while distances[i] < self.lookahead_distance:
+            i = (i + 1) % len(self.path)
+        target = self.path[i]
+
+        # 3. Express the target in the car's frame (x forward, y left).
+        dx, dy = target - car
+        local_y = -math.sin(self.yaw) * dx + math.cos(self.yaw) * dy
+
+        # 4. Pure pursuit: the arc from the rear axle through the target has
+        #    curvature 2*y / L^2, and a bicycle with wheelbase W follows
+        #    curvature k with steering angle atan(W * k).
+        curvature = 2.0 * local_y / self.lookahead_distance ** 2
+        steering = math.atan(self.wheelbase * curvature)
+        steering = max(-self.max_steer, min(self.max_steer, steering))
+
+        return steering, self.crawl_speed
 
     # ------------------------------------------------------------------
     # Output
@@ -171,6 +226,7 @@ class Driver(Node):
         marker.pose.orientation.w = math.cos(target_angle / 2.0)
         array = MarkerArray()
         array.markers.append(marker)
+        array.markers.append(self.path_marker)
         self.marker_pub.publish(array)
 
 
@@ -198,6 +254,6 @@ if __name__ == '__main__':
 #   ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped "{drive: {speed: 0.0, steering_angle: 0.0}}"
 
 #ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
-"{header: {frame_id: map}, pose: {pose: {position: {x: -1.68, y: -0.01}, orientation: {w: 1.0}}}}"
+#"{header: {frame_id: map}, pose: {pose: {position: {x: -1.68, y: -0.01}, orientation: {w: 1.0}}}}"
 
 #ros2 topic echo /ego_racecar/odom --no-arr
