@@ -15,6 +15,11 @@
 
 driver:
   ros__parameters:
-    crawl_speed: 3.0          # [m/s]; you ask for a speed and the sim holds it
+    v_max: 6.0                # [m/s] top speed
+    a_brake: 5.0              # [m/s^2] braking we plan with
+    margin: 0.5               # [m] stop this far short of a wall
+    mu: 1.0489                # tyre friction (the sim's value)
+    ahead_angle: 10.0         # [deg] half-width of the "ahead" cone
     max_range: 8.0            # [m] clip the scan here
-    lookahead_distance: 1.0
+    lookahead_gain: 0.4       # [s] lookahead = gain * speed
+    min_lookahead: 0.5        # [m]

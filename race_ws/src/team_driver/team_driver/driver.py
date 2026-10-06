@@ -55,21 +55,31 @@ class Driver(Node):
         super().__init__('driver')
 
         # Declared parameters can be retuned without editing code:
-        #   ros2 run team_driver driver --ros-args -p crawl_speed:=2.0
+        #   ros2 run team_driver driver --ros-args -p v_max:=4.0
         # Add your own as you go; config/driver_params.yaml loads them.
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('crawl_speed', 3.0)        # [m/s]
+        self.declare_parameter('v_max', 6.0)              # [m/s] top speed
+        self.declare_parameter('a_brake', 5.0)            # [m/s^2] braking we plan with
+        self.declare_parameter('margin', 0.5)             # [m] stop this far short of a wall
+        self.declare_parameter('mu', 1.0489)              # tyre friction (the sim's value)
+        self.declare_parameter('ahead_angle', 10.0)       # [deg] half-width of the "ahead" cone
         self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
-        self.declare_parameter('lookahead_distance', 1.0)  # [m]
+        self.declare_parameter('lookahead_gain', 0.4)      # [s] lookahead = gain * speed
+        self.declare_parameter('min_lookahead', 0.5)       # [m] lookahead never shorter than this
         self.declare_parameter('wheelbase', 0.33)          # [m]
         self.declare_parameter('max_steer', 0.4189)        # [rad]
         self.declare_parameter('centerline_csv', '/hackathon/maps/icra26_centerline.csv')
 
-        self.crawl_speed = self.get_parameter('crawl_speed').value
+        self.v_max = self.get_parameter('v_max').value
+        self.a_brake = self.get_parameter('a_brake').value
+        self.margin = self.get_parameter('margin').value
+        self.mu = self.get_parameter('mu').value
+        self.ahead_angle = math.radians(self.get_parameter('ahead_angle').value)
         self.max_range = self.get_parameter('max_range').value
-        self.lookahead_distance = self.get_parameter('lookahead_distance').value
+        self.lookahead_gain = self.get_parameter('lookahead_gain').value
+        self.min_lookahead = self.get_parameter('min_lookahead').value
         self.wheelbase = self.get_parameter('wheelbase').value
         self.max_steer = self.get_parameter('max_steer').value
 
@@ -182,24 +192,47 @@ class Driver(Node):
         distances = np.linalg.norm(self.path - car, axis=1) #distancefrom each point in path
         i = int(np.argmin(distances))
 
-        # 2. Walk forward along the path until a point is at least one
+        # 2. Look further ahead the faster we go, but never less than
+        #    min_lookahead (at standstill 0.4 * 0 would be 0 m).
+        lookahead = max(self.min_lookahead, self.lookahead_gain * self.speed)
+
+        # 3. Walk forward along the path until a point is at least one
         #    lookahead distance away. The % wraps round at the end of the lap.
-        while distances[i] < self.lookahead_distance:
+        while distances[i] < lookahead:
             i = (i + 1) % len(self.path)
         target = self.path[i]
 
-        # 3. Express the target in the car's frame (x forward, y left).
+        # 4. Express the target in the car's frame (x forward, y left).
         dx, dy = target - car
         local_y = -math.sin(self.yaw) * dx + math.cos(self.yaw) * dy
 
-        # 4. Pure pursuit: the arc from the rear axle through the target has
+        # 5. Pure pursuit: the arc from the rear axle through the target has
         #    curvature 2*y / L^2, and a bicycle with wheelbase W follows
         #    curvature k with steering angle atan(W * k).
-        curvature = 2.0 * local_y / self.lookahead_distance ** 2
+        curvature = 2.0 * local_y / lookahead ** 2
         steering = math.atan(self.wheelbase * curvature)
         steering = max(-self.max_steer, min(self.max_steer, steering))
 
-        return steering, self.crawl_speed
+        # 6. Speed: the smallest of three limits.
+        #    a) Braking: the free distance straight ahead is the shortest beam
+        #       in a narrow cone in front. A car braking at a_brake needs
+        #       v^2 / (2 * a_brake) metres to stop, so the fastest speed that
+        #       can still stop `margin` short of that wall is sqrt(2*a*d).
+        ahead = ranges[np.abs(angles) < self.ahead_angle].min()
+        v_brake = math.sqrt(2.0 * self.a_brake * max(ahead - self.margin, 0.0))
+
+        #    b) Cornering: on a circle of radius R the tyres can hold at most
+        #       mu*g sideways, and sideways acceleration is v^2 / R, so
+        #       v = sqrt(R * mu * g). R is the radius of the arc pure pursuit
+        #       just chose (R = 1 / curvature); a straight line has no limit.
+        if curvature == 0.0:
+            v_corner = float('inf')
+        else:
+            v_corner = math.sqrt(self.mu * 9.81 / abs(curvature))
+
+        speed = min(self.v_max, v_brake, v_corner)
+
+        return steering, speed
 
     # ------------------------------------------------------------------
     # Output
