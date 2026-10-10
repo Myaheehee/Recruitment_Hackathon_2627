@@ -16,7 +16,7 @@
 driver:
   ros__parameters:
     v_max: 6.0                # [m/s] top speed
-    a_brake: 5.0              # [m/s^2] braking we plan with
+    a_brake: 6.11             # [m/s^2] braking we plan with
     margin: 0.5               # [m] stop this far short of a wall
     mu: 1.0489                # tyre friction (the sim's value)
     ahead_angle: 10.0         # [deg] half-width of the "ahead" cone

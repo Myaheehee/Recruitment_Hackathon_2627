@@ -38,15 +38,22 @@ What you publish:
 """
 
 import math
+import os
 
 import numpy as np
 import rclpy
+import yaml
+from PIL import Image
+from scipy import ndimage
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
+
+CAR_HALF_WIDTH = 0.155   # [m] the car is 0.31 m wide (docs/02-simulator.md, 2.8)
+SEAL_RADIUS = 0.40       # [m] gaps in the walls narrower than this are treated as wall
 
 
 class Driver(Node):
@@ -60,8 +67,8 @@ class Driver(Node):
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('odom_topic', '/ego_racecar/odom')
         self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('v_max', 6.0)              # [m/s] top speed
-        self.declare_parameter('a_brake', 5.0)            # [m/s^2] braking we plan with
+        self.declare_parameter('v_max', 7.0)              # [m/s] top speed
+        self.declare_parameter('a_brake', 6.05)           # [m/s^2] braking we plan with
         self.declare_parameter('margin', 0.5)             # [m] stop this far short of a wall
         self.declare_parameter('mu', 1.0489)              # tyre friction (the sim's value)
         self.declare_parameter('ahead_angle', 10.0)       # [deg] half-width of the "ahead" cone
@@ -71,6 +78,11 @@ class Driver(Node):
         self.declare_parameter('wheelbase', 0.33)          # [m]
         self.declare_parameter('max_steer', 0.4189)        # [rad]
         self.declare_parameter('centerline_csv', '/hackathon/maps/icra26_centerline.csv')
+        self.declare_parameter('map_yaml', '/hackathon/maps/icra26.yaml')
+        self.declare_parameter('wall_gap', 0.2)            # [m] air between the car's side and the wall
+        self.declare_parameter('raceline_iters', 20000)    # smoothing passes; more = smoother, slower start
+        self.declare_parameter('raceline_csv', '/tmp/raceline.csv')
+        self.declare_parameter('use_raceline', True)       # False = follow the plain centreline
 
         self.v_max = self.get_parameter('v_max').value
         self.a_brake = self.get_parameter('a_brake').value
@@ -83,25 +95,36 @@ class Driver(Node):
         self.wheelbase = self.get_parameter('wheelbase').value
         self.max_steer = self.get_parameter('max_steer').value
 
-        # The path to follow: an (N, 2) array of x, y points in the map frame,
-        # in driving order. Lines starting with '#' are comments.
-        self.path = np.loadtxt(
+        # The shipped centreline: an (N, 2) array of x, y points in the map
+        # frame, in driving order. Lines starting with '#' are comments.
+        centreline = np.loadtxt(
             self.get_parameter('centerline_csv').value, delimiter=',', comments='#')
 
-        # The path drawn as a closed line for RViz. It never changes, so build
-        # it once here; publish_marker() sends it along with the arrow.
-        self.path_marker = Marker()
-        self.path_marker.header.frame_id = 'map'
-        self.path_marker.ns = 'team_driver'
-        self.path_marker.id = 1
-        self.path_marker.type = Marker.LINE_STRIP
-        self.path_marker.action = Marker.ADD
-        self.path_marker.scale.x = 0.05                       # line width [m]
-        self.path_marker.color.r, self.path_marker.color.g = 1.0, 0.8
-        self.path_marker.color.a = 1.0
-        self.path_marker.pose.orientation.w = 1.0
-        for x, y in np.vstack([self.path, self.path[:1]]):   # repeat point 0 to close the loop
-            self.path_marker.points.append(Point(x=float(x), y=float(y)))
+        # Build our own racing line from the map: a function that tells us
+        # how far any point is from the nearest wall, then a smoother that
+        # slides the centreline sideways to take the bends as gently as the
+        # walls allow. The line must keep the car's half width plus `wall_gap`
+        # of clearance everywhere.
+        clearance = self.load_clearance_map(self.get_parameter('map_yaml').value)
+        margin = CAR_HALF_WIDTH + self.get_parameter('wall_gap').value
+        self.raceline = self.build_raceline(centreline, clearance, margin)
+
+        # Keep a copy on disk so you can plot it or load it elsewhere.
+        csv_path = self.get_parameter('raceline_csv').value
+        try:
+            np.savetxt(csv_path, self.raceline, delimiter=',', fmt='%.4f',
+                       header='x_m, y_m\nRacing line built by team_driver at startup '
+                              'from the map and the centreline.')
+        except OSError as err:
+            self.get_logger().warn(f'could not save the racing line to {csv_path}: {err}')
+
+        # The path pure pursuit follows.
+        self.path = self.raceline if self.get_parameter('use_raceline').value else centreline
+
+        # Both lines drawn for RViz: centreline in yellow, racing line in red.
+        # They never change, so build them once; publish_marker() sends them.
+        self.centre_marker = self.line_marker(centreline, marker_id=1, colour=(1.0, 0.8, 0.0))
+        self.raceline_marker = self.line_marker(self.raceline, marker_id=2, colour=(1.0, 0.0, 0.0))
 
         # Latest known pose and speed. Ground truth from the simulator, which
         # the rules allow you to use - so use it.
@@ -122,6 +145,180 @@ class Driver(Node):
         self.get_logger().warn(
             'team_driver is up, but this template has no driving logic: it will '
             'crawl straight ahead until it hits something. Implement plan().')
+
+    # ------------------------------------------------------------------
+    # The map, read once: how far is any point from the nearest wall?
+    # ------------------------------------------------------------------
+    def load_clearance_map(self, map_yaml):
+        """Read the map image and return a function clearance(points) that
+        gives, for any (x, y) in the map frame, the distance in metres to the
+        nearest wall.
+
+        Cone rows are sealed first. The gaps between cones are wide enough to
+        fit the car, but driving through one is against the rules (rule 11),
+        so for us a row of cones has to count as one solid wall.
+        """
+        with open(map_yaml) as f:
+            meta = yaml.safe_load(f)
+        image_path = os.path.join(os.path.dirname(map_yaml), meta['image'])
+        image = np.array(Image.open(image_path))   # rows x columns, 0 = black
+        resolution = meta['resolution']            # metres per pixel
+        origin_x, origin_y = meta['origin'][0], meta['origin'][1]
+        height = image.shape[0]
+
+        # True where the map is a wall. The map's yaml says a pixel is
+        # occupied when (255 - value) / 255 > occupied_thresh.
+        wall = (255.0 - image) / 255.0 > meta['occupied_thresh']
+
+        # Seal the cone rows. "Closing" an image means: grow every wall by a
+        # disc, then shrink it back by the same disc. Two walls that touched
+        # while grown stay joined after shrinking, so any gap the disc cannot
+        # pass through gets filled in. Cones are 0.25-0.5 m apart, so a
+        # 0.4 m disc bridges every cone gap and leaves the corridors, which
+        # are all over 1 m wide, alone.
+        radius = int(round(SEAL_RADIUS / resolution))            # in pixels
+        yy, xx = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        disc = xx * xx + yy * yy <= radius * radius
+        wall = ndimage.binary_closing(wall, structure=disc)
+
+        # For every pixel, the distance to the nearest wall pixel, in metres.
+        clearance_grid = ndimage.distance_transform_edt(~wall) * resolution
+
+        def clearance(points):
+            """points: an (..., 2) array of x, y -> metres to the nearest wall."""
+            # World (x, y) -> pixel (row, col). Image rows count down from the
+            # top while map y counts up, hence the flip. Pixel centres sit on
+            # whole numbers, so the -0.5 puts a point in the right place
+            # between them.
+            cols = (points[..., 0] - origin_x) / resolution - 0.5
+            rows = height - 1 - ((points[..., 1] - origin_y) / resolution - 0.5)
+            # Look every point up in one call, blending the 4 nearest pixels
+            # (order=1). Off the map (cval) counts as touching a wall.
+            return ndimage.map_coordinates(
+                clearance_grid, [rows, cols], order=1, mode='constant', cval=0.0)
+
+        return clearance
+
+    # ------------------------------------------------------------------
+    # The racing line, built once from the centreline and the map.
+    # ------------------------------------------------------------------
+    def build_raceline(self, centre, clearance, margin):
+        """Slide the centreline's points sideways so the lap bends as little
+        as possible, without ever coming closer than `margin` to a wall.
+
+        Why: the speed the car can carry through a bend depends on how tight
+        the bend is (plan() step 6b), so the line that bends least is the
+        line that can be driven fastest. Wide in, clip the inside, wide out
+        is exactly what a bend-minimising line looks like.
+
+        How: each point may only move sideways (at right angles to the
+        track), so the whole line is described by one number per point, how
+        far it has slid. A simple loop then nudges every point a little in
+        whichever sideways direction reduces the total bending, clamps it to
+        where the car still fits, and repeats thousands of times.
+        """
+        n = len(centre)
+
+        # 1. The direction of travel at every point, and the direction that
+        #    is "left" of it. np.roll shifts the array by one place, so
+        #    np.roll(centre, -1)[i] is the next point and np.roll(centre, 1)[i]
+        #    the previous one; it wraps round because the lap is a loop.
+        tangent = np.roll(centre, -1, axis=0) - np.roll(centre, 1, axis=0)
+        tangent /= np.linalg.norm(tangent, axis=1, keepdims=True)    # make length 1
+        left = np.stack([-tangent[:, 1], tangent[:, 0]], axis=1)       # turn 90 degrees anticlockwise
+
+        # 2. How far may each point slide? Lay out sample points sideways
+        #    from every centreline point, 2.5 cm apart, up to 3 m each way,
+        #    and ask the map how far each sample is from a wall. A point may
+        #    slide up to the last sample at which the car still has `margin`.
+        step = 0.025
+        reach = int(3.0 / step)
+        shifts = np.arange(-reach, reach + 1) * step                    # -3.0, -2.975, ..., +3.0 (left)
+        zero = reach                                                     # index of shift 0, the centreline itself
+        samples = centre[:, None, :] + shifts[None, :, None] * left[:, None, :]   # shape (n, shifts, 2)
+        fits = clearance(samples) >= margin                              # shape (n, shifts), True = car fits
+
+        def steps_until_blocked(mask):
+            # How many True in a row at the start of each row of `mask`.
+            blocked = ~mask
+            return np.where(blocked.any(axis=1), blocked.argmax(axis=1), mask.shape[1])
+
+        # Going left from the centreline is fits[:, zero:]; going right is the
+        # same columns read backwards. The "- 1" is because the count includes
+        # the centreline sample itself, and the maximum with 0 means a point
+        # that is already too close to a wall simply stays where it is.
+        max_left = np.maximum((steps_until_blocked(fits[:, zero:]) - 1) * step, 0.0)
+        max_right = np.maximum((steps_until_blocked(fits[:, :zero + 1][:, ::-1]) - 1) * step, 0.0)
+
+        # 3. The smoothing loop. `shift` is how far each point has slid to
+        #    the left (negative = to the right); everyone starts at 0.
+        #    `rate` is how big each nudge is: 0.12 is just under the largest
+        #    value that does not make the loop blow up.
+        rate = 0.12
+        shift = np.zeros(n)
+        for _ in range(self.get_parameter('raceline_iters').value):
+            points = centre + shift[:, None] * left
+            # How far each point sticks out from the straight line through its
+            # two neighbours. Zero on a straight, bigger the tighter the bend.
+            # The total bending we want to minimise is the sum of bend**2.
+            bend = np.roll(points, 1, axis=0) - 2.0 * points + np.roll(points, -1, axis=0)
+            # Moving point i changes three bends: its own (where it counts
+            # twice, with a minus sign) and those of both its neighbours.
+            # Adding them up with those weights gives the direction in which
+            # moving point i makes the total bending grow fastest ...
+            push = np.roll(bend, 1, axis=0) - 2.0 * bend + np.roll(bend, -1, axis=0)
+            # ... so nudge it the opposite way. Only the sideways part of the
+            # push counts, because sideways is the only way a point may move.
+            shift -= rate * np.sum(push * left, axis=1)
+            # And never further than the walls allow.
+            shift = np.clip(shift, -max_right, max_left)
+
+        raceline = centre + shift[:, None] * left
+
+        # 4. The points have bunched up on the inside of bends and spread out
+        #    on the outside; space them out evenly again.
+        raceline = self.resample(raceline, spacing=0.2)
+
+        # 5. Belt and braces: check the finished line against the map. The
+        #    0.05 m allows for the pixel grid and the resampling.
+        worst = clearance(raceline).min()
+        length = np.linalg.norm(np.roll(raceline, -1, axis=0) - raceline, axis=1).sum()
+        self.get_logger().info(
+            f'racing line: {len(raceline)} points, {length:.1f} m per lap '
+            f'(centreline {len(centre)} points), closest approach to a wall {worst:.2f} m')
+        if worst < margin - 0.05:
+            self.get_logger().error(
+                'racing line comes too close to a wall; following the centreline instead')
+            return centre
+        return raceline
+
+    @staticmethod
+    def resample(points, spacing):
+        """The same closed loop, redrawn as evenly spaced points."""
+        closed = np.vstack([points, points[:1]])                   # repeat point 0 to close the loop
+        segment = np.linalg.norm(np.diff(closed, axis=0), axis=1)  # length of each step along the loop
+        along = np.concatenate([[0.0], np.cumsum(segment)])        # distance travelled to reach each point
+        count = int(round(along[-1] / spacing))
+        wanted = np.linspace(0.0, along[-1], count, endpoint=False)  # where the new points go
+        # np.interp reads off x (and then y) at each wanted distance.
+        return np.stack([np.interp(wanted, along, closed[:, 0]),
+                         np.interp(wanted, along, closed[:, 1])], axis=1)
+
+    def line_marker(self, points, marker_id, colour):
+        """A closed loop drawn as a thin line in RViz. `colour` is (r, g, b), 0..1."""
+        marker = Marker()
+        marker.header.frame_id = 'map'
+        marker.ns = 'team_driver'
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = 0.05                                      # line width [m]
+        marker.color.r, marker.color.g, marker.color.b = colour
+        marker.color.a = 1.0
+        marker.pose.orientation.w = 1.0
+        for x, y in np.vstack([points, points[:1]]):              # repeat point 0 to close the loop
+            marker.points.append(Point(x=float(x), y=float(y)))
+        return marker
 
     # ------------------------------------------------------------------
     # Odometry: where the car is. Free, accurate, and worth building on.
@@ -189,15 +386,15 @@ class Driver(Node):
         car = np.array(self.position)
 
         # 1. Find the path point closest to the car.
-        distances = np.linalg.norm(self.path - car, axis=1) #distancefrom each point in path
+        distances = np.linalg.norm(self.path - car, axis=1) #distance of car from each point in self.path
         i = int(np.argmin(distances))
 
         # 2. Look further ahead the faster we go, but never less than
         #    min_lookahead (at standstill 0.4 * 0 would be 0 m).
         lookahead = max(self.min_lookahead, self.lookahead_gain * self.speed)
 
-        # 3. Walk forward along the path until a point is at least one
-        #    lookahead distance away. The % wraps round at the end of the lap.
+        ''' 3. Walk forward along the path until a point is at least one
+            lookahead distance away. The % wraps round at the end of the lap. '''
         while distances[i] < lookahead:
             i = (i + 1) % len(self.path)
         target = self.path[i]
@@ -259,7 +456,8 @@ class Driver(Node):
         marker.pose.orientation.w = math.cos(target_angle / 2.0)
         array = MarkerArray()
         array.markers.append(marker)
-        array.markers.append(self.path_marker)
+        array.markers.append(self.centre_marker)
+        array.markers.append(self.raceline_marker)
         self.marker_pub.publish(array)
 
 
