@@ -1,0 +1,3 @@
+# Training output: weights and logs of every run. Copy the weights you want
+# to race into race_ws/src/team_driver/models/ (see README.md).
+runs/

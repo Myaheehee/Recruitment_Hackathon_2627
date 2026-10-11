@@ -1,0 +1,14 @@
+# Python packages for TRAINING only (on your PC, in ~/venvs/rl).
+# The driver does not need any of these beyond what the judging image already
+# has: it runs the trained network with plain numpy.
+#
+# Install with:  training/setup_venv.sh
+#
+# The simulator itself, from the pinned submodule, so training uses the same
+# physics as the judged race. Its own dependencies (numpy, scipy, gymnasium,
+# numba, ...) come with it.
+./external/f1tenth_gym
+# JAX with NVIDIA GPU support (CUDA 13). Same JAX version as the judging image.
+jax[cuda13]==0.11.2
+# Optimisers (Adam) for training the network.
+optax==0.2.8
