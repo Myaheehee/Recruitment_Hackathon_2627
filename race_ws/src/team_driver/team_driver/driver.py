@@ -3,10 +3,12 @@
 
 What happens, and where to read about it:
     at startup     build the racing line from the map             raceline.py
-                   load the trained correction network, if any    residual.py
+                   load a trained policy, if there is one         residual.py
     on odometry    remember where the car is and how fast         odom_callback()
-    on each scan   pure pursuit picks steering and speed          pure_pursuit.py
-                   the network (if loaded) adds a small correction
+    on each scan   the lookahead policy (if loaded) picks how
+                   far ahead to aim                               residual.py
+                   pure pursuit picks steering and speed          pure_pursuit.py
+                   the residual network (if loaded) adds a small correction
                    send the command on /drive                     scan_callback()
 
 Topics
@@ -42,7 +44,9 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from team_driver.pure_pursuit import DEFAULTS, preprocess, pure_pursuit
 from team_driver.raceline import CAR_HALF_WIDTH, ITERS, WALL_GAP, build_raceline, load_clearance_map
-from team_driver.residual import actor, apply_residual, features, load_weights, path_geometry
+from team_driver.residual import (
+    LOOKAHEAD_INPUTS, LOOKAHEAD_RANGE, actor, apply_residual, features, load_lookahead,
+    load_weights, lookahead, lookahead_inputs, path_geometry)
 
 
 class Driver(Node):
@@ -51,7 +55,7 @@ class Driver(Node):
         super().__init__('driver')
         self.params = self.setup_parameters()
         self.path = self.build_path()
-        self.load_network()
+        self.load_policy()
 
         # The car's latest state, from odometry.
         self.position = None      # (x, y) of the rear axle; None until odometry arrives
@@ -88,7 +92,9 @@ class Driver(Node):
         self.declare_parameter('raceline_iters', ITERS)    # more = smoother line, slower startup
         self.declare_parameter('raceline_csv', '/tmp/raceline.csv')   # a copy of the line, for plotting
         self.declare_parameter('use_raceline', True)       # False = follow the plain centreline
-        self.declare_parameter('use_residual', True)       # False = ignore the trained network
+        self.declare_parameter('use_lookahead', True)      # False = ignore models/lookahead.npz
+        self.declare_parameter('lookahead_weights', '')    # blank = models/lookahead.npz in this package
+        self.declare_parameter('use_residual', True)       # False = ignore models/residual.npz
         self.declare_parameter('residual_weights', '')     # blank = models/residual.npz in this package
         return {name: self.param(name) for name in DEFAULTS}
 
@@ -113,26 +119,50 @@ class Driver(Node):
 
         return raceline if self.param('use_raceline') else centreline
 
-    def load_network(self):
-        """Load the trained correction network (see training/), if there is
-        one. Without it the car drives on pure pursuit alone."""
+    def load_policy(self):
+        """Load a trained policy (see training/), if there is one:
+            models/lookahead.npz   chooses pure pursuit's lookahead distance
+            models/residual.npz    corrects pure pursuit's steering and speed
+        If both exist only the lookahead policy is used: the residual network
+        learned to correct pure pursuit with its own speed rule for the
+        lookahead, not with a learned one. With neither, pure pursuit drives alone."""
+        self.lookahead_policy = None
         self.weights = None
         self.heading, self.curvature = path_geometry(self.path)
-        if not self.param('use_residual'):
-            return
-        path = self.param('residual_weights') or os.path.join(
-            get_package_share_directory('team_driver'), 'models', 'residual.npz')
-        if not os.path.isfile(path):
-            self.get_logger().info(f'no residual network at {path}: pure pursuit only')
+
+        path = self.policy_file('lookahead')
+        if path:
+            self.lookahead_policy, trained_with = load_lookahead(path)
+            w, b = self.lookahead_policy['w'], self.lookahead_policy['b']
+            equation = ' '.join(f'{x:+.3f}*{name}' for x, name in zip(w, LOOKAHEAD_INPUTS))
+            self.get_logger().info(f'lookahead policy loaded from {path}: L = {b:.3f} {equation}')
+            self.warn_if_retuned(trained_with)
             return
 
-        self.weights, self.limits, trained_with = load_weights(path)
-        self.get_logger().info(f'residual network loaded from {path}, limits {self.limits}')
-        # The network learned to correct pure pursuit tuned the way it was
-        # during training. If the tuning has changed since, retrain it.
+        path = self.policy_file('residual')
+        if path:
+            self.weights, self.limits, trained_with = load_weights(path)
+            self.get_logger().info(f'residual network loaded from {path}, limits {self.limits}')
+            self.warn_if_retuned(trained_with)
+            return
+
+        self.get_logger().info('no trained policy: pure pursuit only')
+
+    def policy_file(self, kind):
+        """Where the `kind` ('lookahead' or 'residual') policy is, or None if
+        it is switched off (use_<kind>:=false) or has not been trained yet."""
+        if not self.param(f'use_{kind}'):
+            return None
+        path = self.param(f'{kind}_weights') or os.path.join(
+            get_package_share_directory('team_driver'), 'models', f'{kind}.npz')
+        return path if os.path.isfile(path) else None
+
+    def warn_if_retuned(self, trained_with):
+        """A policy learned to work with pure pursuit tuned the way it was
+        during training. If the tuning has changed since, retrain it."""
         changed = [k for k, v in trained_with.items() if self.params.get(k) != v]
         if changed:
-            self.get_logger().warn(f'pure pursuit settings changed since the network was '
+            self.get_logger().warn(f'pure pursuit settings changed since the policy was '
                                    f'trained: {changed}. Retrain it (training/README.md).')
 
     # ------------------------------------------------------------------
@@ -162,12 +192,21 @@ class Driver(Node):
             return 0.0, 0.0
         car = np.array(self.position)
 
-        # 1. Pure pursuit along the racing line, with the speed limits.
-        steering, speed, nearest, ahead = pure_pursuit(
-            self.path, car, self.yaw, self.speed, ranges, angles, self.params)
+        # 1. How far ahead to aim. The lookahead policy, if loaded, decides
+        #    from the speed and how sharply the line bends ahead. Otherwise
+        #    (None) pure pursuit uses its own rule, lookahead_gain * speed.
+        distance = None
+        if self.lookahead_policy is not None:
+            nearest = np.argmin(np.linalg.norm(self.path - car, axis=1))
+            s = lookahead_inputs(self.curvature, nearest, self.speed)
+            distance = float(np.clip(lookahead(self.lookahead_policy, s), *LOOKAHEAD_RANGE))
 
-        # 2. The learned correction, if a network is loaded: describe the
-        #    situation as numbers, ask the network, add its capped answer.
+        # 2. Pure pursuit along the racing line, with the speed limits.
+        steering, speed, nearest, ahead = pure_pursuit(
+            self.path, car, self.yaw, self.speed, ranges, angles, self.params, lookahead=distance)
+
+        # 3. The learned correction, if a residual network is loaded: describe
+        #    the situation as numbers, ask the network, add its capped answer.
         if self.weights is not None:
             x = features(self.path, self.heading, self.curvature, car, self.yaw,
                          self.speed, self.yaw_rate, self.last_steer,

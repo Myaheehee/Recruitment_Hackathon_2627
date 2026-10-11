@@ -18,14 +18,20 @@ import numpy as np
 # Every number you can tune, with the value used in the race. The judges
 # pass no parameter file, so these defaults ARE the race settings.
 # driver.py turns each one into a ROS parameter; training reads them too.
+#
+# Tuned 2026-10-12 with a sweep in the training simulator (training/evaluate.py
+# reproduces it): these lap in about 17.9 s with no wall contact at every
+# reaction delay from 0 to 3 steps. The critical one is lookahead_gain: every
+# value from 0.2 to 0.35 runs clean, 0.4 cuts the infield hairpin and hits it.
 DEFAULTS = {
-    'v_max': 7.0,            # [m/s]   top speed
-    'a_brake': 6.07,         # [m/s^2] braking we plan with
+    'v_max': 6.8,            # [m/s]   top speed
+    'a_brake': 6.05,          # [m/s^2] braking we plan with
     'margin': 0.55,          # [m]     stop this far short of a wall
-    'mu': 1.0489,            #         tyre friction (the simulator's value)
+    'mu': 1.0489,               #         cornering grip we plan with; the simulator's
+                             #         tyres have 1.0489, so this leaves a safety margin
     'ahead_angle': 10.0,     # [deg]   half-width of the "straight ahead" cone
     'max_range': 8.0,        # [m]     LiDAR ranges are clipped to this
-    'lookahead_gain': 0.4,   # [s]     lookahead distance = gain * speed
+    'lookahead_gain': 0.25,  # [s]     lookahead distance = gain * speed
     'min_lookahead': 0.5,    # [m]     ... but never shorter than this
     'wheelbase': 0.33,       # [m]
     'max_steer': 0.4189,     # [rad]

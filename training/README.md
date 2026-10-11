@@ -121,6 +121,12 @@ adjusts the 5 weights and the bias. Where the code is:
 ~/venvs/rl/bin/python training/evaluate.py --lookahead training/runs/<run>/lookahead.npz
 ```
 
+To race it, copy it into the driver's package and rebuild, exactly as for the
+residual (step 4 of the loop above, with `lookahead.npz`). At startup the
+driver logs `lookahead policy loaded from ...: L = ...`. If both
+`lookahead.npz` and `residual.npz` are there, only the lookahead policy is
+used. Turn it off with `-p use_lookahead:=false`.
+
 Training prints the current equation every 5 updates, and the mean L on
 straight and on curved parts of the track. The paper's finding is that the
 policy lengthens L on straights and shortens it in curves; check whether
@@ -137,8 +143,7 @@ Where this differs from the paper: the policy is linear rather than a
 neural network; the reward leaves out the paper's ideal-lookahead and
 curvature terms; its curvature horizons are not given, so 1 m and 3 m are
 ours; L is not smoothed before use; and every episode
-gets a random reaction delay (below). The driver does not load
-`lookahead.npz` yet.
+gets a random reaction delay (below).
 
 ## How the simulator matches the race, and where it does not
 

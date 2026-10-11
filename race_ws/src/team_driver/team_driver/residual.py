@@ -21,6 +21,8 @@ once with jax.vmap, which applies a one-car function to every car.
 
 import numpy as np
 
+from team_driver.pure_pursuit import DEFAULTS
+
 # ======================================================================
 # 1. Residual: a network adds a capped correction to pure pursuit
 # ======================================================================
@@ -129,9 +131,10 @@ LOOKAHEAD_INPUTS = ('v', '|k0|', '|k1|', '|k2|', 'dk')
 HORIZONS = (0, 5, 15)                  # path points ahead (0.2 m apart)
 LOOKAHEAD_RANGE = (0.35, 4.0)          # [m] the paper's limits on L (eq. 12)
 
-# Where training starts: L = 0.4 * v, close to the hand-made rule in
-# pure_pursuit.py (max(0.5, 0.4 * v)). So training begins from today's driver.
-START_WEIGHTS = (0.4, 0.0, 0.0, 0.0, 0.0)
+# Where training starts: L = lookahead_gain * v, close to the hand-made rule
+# in pure_pursuit.py (max(min_lookahead, lookahead_gain * v)). So training
+# begins from today's driver.
+START_WEIGHTS = (DEFAULTS['lookahead_gain'], 0.0, 0.0, 0.0, 0.0)
 START_BIAS = 0.0
 
 
