@@ -44,7 +44,7 @@ sys.path.insert(0, str(REPO / 'race_ws' / 'src' / 'team_driver'))
 from team_driver.pure_pursuit import DEFAULTS, preprocess, pure_pursuit  # noqa: E402
 from team_driver.raceline import (  # noqa: E402
     CAR_HALF_WIDTH, ITERS, WALL_GAP, build_raceline, load_clearance_map)
-from team_driver.residual import features, path_geometry  # noqa: E402
+from team_driver.residual import features, lookahead_inputs, path_geometry  # noqa: E402
 
 from f1tenth_gym.envs.action import LongitudinalActionType, SteerActionType  # noqa: E402
 from f1tenth_gym.envs.contact import ContactConfig  # noqa: E402
@@ -166,6 +166,39 @@ def make_controller(path):
         return jax.vmap(one_car)(car, yaw, speed, yaw_rate, ranges, last_steer)
 
     return controller
+
+
+def make_lookahead_controller(path):
+    """For the dynamic-lookahead policy. Returns two functions, each taking
+    a batch of cars:
+        inputs(observation)        -> (cars, 5) the policy's inputs s
+        drive(observation, L)      -> (steering, speed) from pure pursuit
+                                      aiming L metres ahead (one L per car)
+    """
+    _, curvature = path_geometry(path)
+    path, curvature = jnp.asarray(path), jnp.asarray(curvature)
+    first, last, beams = scan_slice()
+    angles = jnp.asarray(first + np.arange(beams) * (last - first) / (beams - 1))
+
+    def inputs_one_car(car, speed):
+        nearest = jnp.argmin(jnp.linalg.norm(path - car, axis=1))
+        return lookahead_inputs(curvature, nearest, speed, xp=jnp)
+
+    def drive_one_car(car, yaw, speed, ranges, distance):
+        steer, v, _, _ = pure_pursuit(path, car, yaw, speed, ranges, angles, DEFAULTS,
+                                      xp=jnp, lookahead=distance)
+        return steer, v
+
+    def inputs(observation):
+        car, _, speed, _ = odometry(observation)
+        return jax.vmap(inputs_one_car)(car, speed)
+
+    def drive(observation, distance):
+        car, yaw, speed, _ = odometry(observation)
+        ranges = preprocess(observation.scans[:, 0], DEFAULTS['max_range'], xp=jnp)
+        return jax.vmap(drive_one_car)(car, yaw, speed, ranges, distance)
+
+    return inputs, drive
 
 
 def odometry(observation):

@@ -42,7 +42,7 @@ def preprocess(ranges, max_range, xp=np):
     return xp.clip(ranges, 0.0, max_range)
 
 
-def pure_pursuit(path, car, yaw, speed, ranges, angles, params, xp=np):
+def pure_pursuit(path, car, yaw, speed, ranges, angles, params, xp=np, lookahead=None):
     """Decide the steering angle and speed for one car.
 
     Inputs
@@ -52,6 +52,8 @@ def pure_pursuit(path, car, yaw, speed, ranges, angles, params, xp=np):
         speed    the car's speed [m/s]
         ranges   cleaned LiDAR ranges [m], with `angles` the angle of each beam [rad]
         params   the tuning table: DEFAULTS, or the driver's ROS parameters
+        lookahead  [m] how far ahead to aim; leave it out to use the speed rule
+                   in step 2 (a learned policy can choose it: residual.lookahead)
 
     Returns (steering [rad], speed [m/s], nearest, ahead). The last two are
     the index of the path point closest to the car and the free distance
@@ -62,7 +64,10 @@ def pure_pursuit(path, car, yaw, speed, ranges, angles, params, xp=np):
     nearest = xp.argmin(distances)
 
     # 2. How far ahead to aim: further when faster, but at least min_lookahead.
-    lookahead = xp.maximum(params['min_lookahead'], params['lookahead_gain'] * speed)
+    #    (Unless the caller chose it. `is None` is checked by Python before
+    #    JAX compiles anything, so this `if` is allowed.)
+    if lookahead is None:
+        lookahead = xp.maximum(params['min_lookahead'], params['lookahead_gain'] * speed)
 
     # 3. The target: the first point after `nearest` that is at least
     #    `lookahead` away from the car. `order` lists the path indices

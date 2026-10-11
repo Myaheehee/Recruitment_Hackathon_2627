@@ -4,6 +4,7 @@ sim.MAX_DELAY steps (the cars race side by side, each in its own world).
 
     python training/evaluate.py                       # pure pursuit only
     python training/evaluate.py --weights training/runs/<run>/residual.npz
+    python training/evaluate.py --lookahead training/runs/<run>/lookahead.npz
 
 This is a quick check, not the official result: the race runs in ROS
 (scripts/evaluate.sh), and nobody knows its exact reaction delay. A driver
@@ -19,7 +20,8 @@ import numpy as np
 
 import sim
 from team_driver.pure_pursuit import DEFAULTS
-from team_driver.residual import actor, apply_residual, load_weights
+from team_driver.residual import (
+    LOOKAHEAD_RANGE, actor, apply_residual, load_lookahead, load_weights, lookahead)
 
 CHUNK = 1000     # physics steps per compiled chunk (10 s of racing)
 
@@ -28,6 +30,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--weights', help='residual.npz to add (default: pure pursuit only)')
+    parser.add_argument('--lookahead', help='lookahead.npz: let it choose the lookahead distance')
     parser.add_argument('--laps', type=int, default=11, help='laps to drive, warm-up included')
     parser.add_argument('--max-time', type=float, default=300.0, help='give up after this [s]')
     parser.add_argument('--device', choices=('cpu', 'gpu'), default='cpu',
@@ -38,6 +41,7 @@ def main():
     path = sim.racing_line()
     simulator = sim.make_simulator(device, training=False)
     controller = sim.make_controller(path)
+    inputs, drive = sim.make_lookahead_controller(path)
     delays = jnp.arange(sim.MAX_DELAY + 1)          # one car per delay
     cars = len(delays)
 
@@ -49,9 +53,26 @@ def main():
         if changed:
             print(f'WARNING: pure pursuit settings changed since training: {changed}')
 
+    policy = None
+    if args.lookahead:
+        if args.weights:
+            parser.error('use --weights or --lookahead, not both')
+        policy, trained_with = load_lookahead(args.lookahead)
+        changed = [k for k, v in trained_with.items() if DEFAULTS.get(k) != v]
+        if changed:
+            print(f'WARNING: pure pursuit settings changed since training: {changed}')
+        w, b = policy['w'], policy['b']
+        print('L = ' + f'{b:.3f} ' + ' '.join(f'{"-" if x < 0 else "+"} {abs(x):.3f}*{n}'
+                                            for x, n in zip(w, ('v', '|k0|', '|k1|', '|k2|', 'dk'))))
+        policy = {'w': jnp.asarray(w), 'b': jnp.asarray(b)}
+
     def step(carry, key):
         state, observation, last_steer, queue = carry
         steer, speed, x = controller(observation, last_steer)
+        if policy is not None:
+            # The policy's best guess for L, with no exploration noise.
+            distance = jnp.clip(lookahead(policy, inputs(observation), xp=jnp), *LOOKAHEAD_RANGE)
+            steer, speed = drive(observation, distance)
         if weights is not None:
             # Racing uses the network's best guess, with no exploration noise.
             squashed = jnp.tanh(actor(weights, x, xp=jnp))
@@ -88,7 +109,9 @@ def main():
         if min(len(t) for t in lap_times) >= args.laps:
             break
 
-    print(f'\n{"residual " + args.weights if args.weights else "pure pursuit only"}'
+    name = (f'residual {args.weights}' if args.weights else
+            f'dynamic lookahead {args.lookahead}' if args.lookahead else 'pure pursuit only')
+    print(f'\n{name}'
           f'  ({time.time() - started:.0f} s of computer time)\n')
     print('delay   laps   best timed lap   10-lap total   wall contacts (time touching)')
     for car in range(cars):

@@ -8,6 +8,9 @@
    command, the same network inputs and the same network output.
 3. A weights file written by train.py reads back correctly with the
    driver's loader.
+4. The dynamic-lookahead policy: numpy and jax.numpy agree on its 5 inputs,
+   on L, on pure pursuit aiming L ahead, and on the loss; JAX's gradient of
+   the loss matches a numerical one; a saved policy reads back correctly.
 
 If any of these fail, a network trained here would be racing a different
 controller from the one it learned to correct.
@@ -26,7 +29,9 @@ import numpy as np
 
 import sim
 from team_driver.pure_pursuit import DEFAULTS, pure_pursuit
-from team_driver.residual import actor, features, load_weights, path_geometry
+from team_driver.residual import (
+    actor, features, load_lookahead, load_weights, lookahead, lookahead_inputs, lookahead_loss,
+    path_geometry)
 import train
 
 ORIGINAL = '0c2a770'      # last commit with plan() written out inside driver.py
@@ -74,7 +79,7 @@ def main():
     assert worst < 1e-9
 
     # 2. numpy == jax, for pure pursuit, features and the network.
-    params = train.init_params(jax.random.key(1), 128)
+    params = train.init_params(jax.random.key(1), 'residual', 128)
     # Make the network's output big enough that a mismatch would show.
     params['actor']['W2'] = params['actor']['W2'] * 100.0
     weights_np = {k: np.asarray(v, dtype=np.float64) for k, v in params['actor'].items()}
@@ -109,11 +114,71 @@ def main():
     # 3. A saved file loads back with the driver's loader.
     with tempfile.TemporaryDirectory() as tmp:
         file = f'{tmp}/residual.npz'
-        train.save(file, params, Namespace(note='test'))
+        train.save(file, params, Namespace(method='residual'))
         loaded, limits, trained_with = load_weights(file)
     assert all(np.array_equal(loaded[k], np.asarray(params['actor'][k])) for k in loaded)
     assert trained_with == DEFAULTS, trained_with
     print(f'3. save -> load round trip OK, limits {limits}')
+
+    # 4. Dynamic lookahead.
+    policy = {'w': np.array([0.35, -0.4, -0.3, -0.2, 0.5]), 'b': 0.3}
+    jpolicy = {'w': jnp.asarray(policy['w']), 'b': jnp.asarray(policy['b'])}
+    worst = {'inputs': 0.0, 'L': 0.0, 'command': 0.0}
+    for _ in range(300):
+        s = random_situation(rng, path, angles)
+        nearest = int(np.argmin(np.linalg.norm(path - s['car'], axis=1)))
+        x = lookahead_inputs(curvature, nearest, s['speed'])
+        jx = lookahead_inputs(j['curvature'], jnp.asarray(nearest), jnp.asarray(s['speed']), xp=jnp)
+        distance = float(np.clip(lookahead(policy, x), 0.35, 4.0))
+        jdistance = lookahead(jpolicy, jx, xp=jnp)
+        command = pure_pursuit(path, s['car'], s['yaw'], s['speed'], s['ranges'], angles,
+                               DEFAULTS, lookahead=distance)
+        jcommand = pure_pursuit(j['path'], jnp.asarray(s['car']), s['yaw'], s['speed'],
+                                jnp.asarray(s['ranges']), j['angles'], DEFAULTS, xp=jnp,
+                                lookahead=jnp.asarray(distance))
+        worst['inputs'] = max(worst['inputs'], float(np.max(np.abs(x - np.asarray(jx)))))
+        worst['L'] = max(worst['L'], abs(float(lookahead(policy, x)) - float(jdistance)))
+        worst['command'] = max(worst['command'], abs(command[0] - float(jcommand[0])),
+                               abs(command[1] - float(jcommand[1])))
+    # Passing the speed rule's own lookahead must change nothing.
+    s = random_situation(rng, path, angles)
+    rule = max(DEFAULTS['min_lookahead'], DEFAULTS['lookahead_gain'] * s['speed'])
+    plain = pure_pursuit(path, s['car'], s['yaw'], s['speed'], s['ranges'], angles, DEFAULTS)
+    given = pure_pursuit(path, s['car'], s['yaw'], s['speed'], s['ranges'], angles, DEFAULTS,
+                         lookahead=rule)
+    assert all(np.array_equal(a, b) for a, b in zip(plain, given))
+
+    # The loss, and its gradient with respect to the 5 weights.
+    batch = rng.normal(size=(256, 5)) * [3, .5, .5, .5, .3] + [4, .5, .5, .5, 0]
+    chosen = lookahead(policy, batch) + rng.normal(0, 0.3, 256)
+    old_log_prob = rng.normal(-0.5, 0.1, 256)
+    advantage = rng.normal(size=256)
+    args = (np.log(0.3), batch, chosen, old_log_prob, advantage, 0.2, 0.02)
+    numpy_loss, _ = lookahead_loss(policy, *args)
+    jax_args = tuple(jnp.asarray(a) for a in args)
+    jax_loss, _ = lookahead_loss(jpolicy, *jax_args, xp=jnp)
+    gradient = jax.grad(lambda p: lookahead_loss(p, *jax_args, xp=jnp)[0])(jpolicy)['w']
+    numerical = np.zeros(5)
+    for i in range(5):
+        step = np.zeros(5)
+        step[i] = 1e-6
+        up = lookahead_loss({'w': policy['w'] + step, 'b': policy['b']}, *args)[0]
+        down = lookahead_loss({'w': policy['w'] - step, 'b': policy['b']}, *args)[0]
+        numerical[i] = (up - down) / 2e-6
+    worst['loss'] = abs(numpy_loss - float(jax_loss))
+    worst['gradient'] = float(np.max(np.abs(np.asarray(gradient) - numerical)))
+    print('4. dynamic lookahead, numpy vs jax: '
+          + ', '.join(f'{k} {v:.1e}' for k, v in worst.items()))
+    assert all(v < 1e-3 for v in worst.values()), worst
+
+    with tempfile.TemporaryDirectory() as tmp:
+        file = f'{tmp}/lookahead.npz'
+        lparams = train.init_params(jax.random.key(2), 'lookahead', 16)
+        train.save(file, lparams, Namespace(method='lookahead'))
+        loaded, trained_with = load_lookahead(file)
+    assert np.array_equal(loaded['w'], np.asarray(lparams['actor']['w']))
+    assert trained_with == DEFAULTS
+    print(f'   save -> load round trip OK, starting {train.equation(lparams["actor"])}')
     print('\nAll parity checks passed.')
 
 
