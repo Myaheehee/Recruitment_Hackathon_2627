@@ -43,8 +43,9 @@ sys.path.insert(0, str(REPO / 'race_ws' / 'src' / 'team_driver'))
 
 from team_driver.pure_pursuit import DEFAULTS, preprocess, pure_pursuit  # noqa: E402
 from team_driver.raceline import (  # noqa: E402
-    CAR_HALF_WIDTH, ITERS, WALL_GAP, build_raceline, load_clearance_map)
-from team_driver.residual import features, lookahead_inputs, path_geometry  # noqa: E402
+    CAR_HALF_WIDTH, ITERS, WALL_GAP, build_raceline, load_clearance_map, speed_table)
+from team_driver.residual import (  # noqa: E402
+    features, lookahead_inputs, path_geometry, speed_table_inputs)
 
 from f1tenth_gym.envs.action import LongitudinalActionType, SteerActionType  # noqa: E402
 from f1tenth_gym.envs.contact import ContactConfig  # noqa: E402
@@ -77,6 +78,20 @@ def racing_line():
     centre = np.loadtxt(CENTRELINE_CSV, delimiter=',', comments='#')
     clearance = load_clearance_map(str(MAP_YAML))
     return build_raceline(centre, clearance, CAR_HALF_WIDTH + WALL_GAP, ITERS)
+
+
+def driver_speed_table(path, curvature):
+    """The speed table the driver would use (as a jax array), or None when
+    DEFAULTS['use_speed_table'] is off, exactly as driver.py decides."""
+    if not DEFAULTS['use_speed_table']:
+        return None
+    return jnp.asarray(speed_table(path, curvature, DEFAULTS))
+
+
+def scaled(speeds):
+    """The table slowed down by DEFAULTS['table_scale'], as driver.py does,
+    or None if there is no table."""
+    return None if speeds is None else jnp.asarray(speeds) * DEFAULTS['table_scale']
 
 
 def scan_slice():
@@ -141,21 +156,23 @@ def make_simulator(device, training, episode_steps=3000, collision_penalty=10.0)
     return JaxSimulator(config, track, device=device)
 
 
-def make_controller(path):
+def make_controller(path, speeds=None):
     """Return controller(observation, last_steer) for a batch of cars.
 
     For every car it runs the driver's pure pursuit and builds the residual
     network's inputs, exactly as driver.py does, and returns
     (base_steer, base_speed, features), each with one row per car.
+    `speeds`: a speed table to drive by; None = whatever the driver would use.
     """
     heading, curvature = path_geometry(path)
+    speeds = scaled(driver_speed_table(path, curvature) if speeds is None else speeds)
     path, heading, curvature = jnp.asarray(path), jnp.asarray(heading), jnp.asarray(curvature)
     first, last, beams = scan_slice()
     angles = jnp.asarray(first + np.arange(beams) * (last - first) / (beams - 1))
 
     def one_car(car, yaw, speed, yaw_rate, ranges, last_steer):
         steer, v, nearest, ahead = pure_pursuit(
-            path, car, yaw, speed, ranges, angles, DEFAULTS, xp=jnp)
+            path, car, yaw, speed, ranges, angles, DEFAULTS, xp=jnp, speed_table=speeds)
         x = features(path, heading, curvature, car, yaw, speed, yaw_rate, last_steer,
                      steer, v, nearest, ahead, DEFAULTS, xp=jnp)
         return steer, v, x
@@ -168,14 +185,16 @@ def make_controller(path):
     return controller
 
 
-def make_lookahead_controller(path):
+def make_lookahead_controller(path, speeds=None):
     """For the dynamic-lookahead policy. Returns two functions, each taking
     a batch of cars:
         inputs(observation)        -> (cars, 5) the policy's inputs s
         drive(observation, L)      -> (steering, speed) from pure pursuit
                                       aiming L metres ahead (one L per car)
+    `speeds`: a speed table to drive by; None = whatever the driver would use.
     """
     _, curvature = path_geometry(path)
+    speeds = scaled(driver_speed_table(path, curvature) if speeds is None else speeds)
     path, curvature = jnp.asarray(path), jnp.asarray(curvature)
     first, last, beams = scan_slice()
     angles = jnp.asarray(first + np.arange(beams) * (last - first) / (beams - 1))
@@ -186,7 +205,7 @@ def make_lookahead_controller(path):
 
     def drive_one_car(car, yaw, speed, ranges, distance):
         steer, v, _, _ = pure_pursuit(path, car, yaw, speed, ranges, angles, DEFAULTS,
-                                      xp=jnp, lookahead=distance)
+                                      xp=jnp, lookahead=distance, speed_table=speeds)
         return steer, v
 
     def inputs(observation):
@@ -199,6 +218,38 @@ def make_lookahead_controller(path):
         return jax.vmap(drive_one_car)(car, yaw, speed, ranges, distance)
 
     return inputs, drive
+
+
+def make_speed_table_controller(path):
+    """For training the speed table. Returns two functions, each taking a
+    batch of cars:
+        observe(observation) -> (critic inputs (cars, 7), nearest path point (cars,))
+        steer(observation)   -> steering from pure pursuit with its own
+                                lookahead rule (the speed is the policy's choice)
+    """
+    _, curvature = path_geometry(path)
+    path, curvature = jnp.asarray(path), jnp.asarray(curvature)
+    first, last, beams = scan_slice()
+    angles = jnp.asarray(first + np.arange(beams) * (last - first) / (beams - 1))
+
+    def observe_one_car(car, speed):
+        nearest = jnp.argmin(jnp.linalg.norm(path - car, axis=1))
+        return speed_table_inputs(curvature, nearest, speed, xp=jnp), nearest
+
+    def steer_one_car(car, yaw, speed, ranges):
+        steer, _, _, _ = pure_pursuit(path, car, yaw, speed, ranges, angles, DEFAULTS, xp=jnp)
+        return steer
+
+    def observe(observation):
+        car, _, speed, _ = odometry(observation)
+        return jax.vmap(observe_one_car)(car, speed)
+
+    def steer(observation):
+        car, yaw, speed, _ = odometry(observation)
+        ranges = preprocess(observation.scans[:, 0], DEFAULTS['max_range'], xp=jnp)
+        return jax.vmap(steer_one_car)(car, yaw, speed, ranges)
+
+    return observe, steer
 
 
 def odometry(observation):

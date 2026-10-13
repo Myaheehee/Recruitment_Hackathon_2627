@@ -5,6 +5,7 @@ sim.MAX_DELAY steps (the cars race side by side, each in its own world).
     python training/evaluate.py                       # pure pursuit only
     python training/evaluate.py --weights training/runs/<run>/residual.npz
     python training/evaluate.py --lookahead training/runs/<run>/lookahead.npz
+    python training/evaluate.py --speed-table training/runs/<run>/speed_table.npz
 
 This is a quick check, not the official result: the race runs in ROS
 (scripts/evaluate.sh), and nobody knows its exact reaction delay. A driver
@@ -21,7 +22,8 @@ import numpy as np
 import sim
 from team_driver.pure_pursuit import DEFAULTS
 from team_driver.residual import (
-    LOOKAHEAD_RANGE, actor, apply_residual, load_lookahead, load_weights, lookahead)
+    LOOKAHEAD_RANGE, actor, apply_residual, load_lookahead, load_speed_table, load_weights,
+    lookahead)
 
 CHUNK = 1000     # physics steps per compiled chunk (10 s of racing)
 
@@ -31,17 +33,30 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--weights', help='residual.npz to add (default: pure pursuit only)')
     parser.add_argument('--lookahead', help='lookahead.npz: let it choose the lookahead distance')
+    parser.add_argument('--speed-table',
+                        help='speed_table.npz: drive by this tuned table (with any of the above)')
+    parser.add_argument('--max-delay', type=int, default=sim.MAX_DELAY,
+                        help='largest reaction delay [steps]; each car gets 0..this')
     parser.add_argument('--laps', type=int, default=11, help='laps to drive, warm-up included')
     parser.add_argument('--max-time', type=float, default=300.0, help='give up after this [s]')
     parser.add_argument('--device', choices=('cpu', 'gpu'), default='cpu',
                         help='cpu is faster for a handful of cars')
     args = parser.parse_args()
+    sim.MAX_DELAY = args.max_delay
 
     device = jax.devices(args.device)[0]
     path = sim.racing_line()
     simulator = sim.make_simulator(device, training=False)
-    controller = sim.make_controller(path)
-    inputs, drive = sim.make_lookahead_controller(path)
+    speeds = None                                    # None = whatever the driver would use
+    if args.speed_table:
+        speeds, line, trained_with = load_speed_table(args.speed_table)
+        if line.shape != path.shape or not np.allclose(line, path, atol=1e-3):
+            parser.error(f'{args.speed_table} was tuned on a different racing line')
+        changed = [k for k in DEFAULTS if trained_with.get(k) != DEFAULTS[k]]
+        if changed:
+            print(f'WARNING: pure pursuit settings changed since the table was tuned: {changed}')
+    controller = sim.make_controller(path, speeds)
+    inputs, drive = sim.make_lookahead_controller(path, speeds)
     delays = jnp.arange(sim.MAX_DELAY + 1)          # one car per delay
     cars = len(delays)
 
@@ -49,7 +64,7 @@ def main():
     if args.weights:
         weights, limits, trained_with = load_weights(args.weights)
         weights = {k: jnp.asarray(v) for k, v in weights.items()}
-        changed = [k for k, v in trained_with.items() if DEFAULTS.get(k) != v]
+        changed = [k for k in DEFAULTS if trained_with.get(k) != DEFAULTS[k]]
         if changed:
             print(f'WARNING: pure pursuit settings changed since training: {changed}')
 
@@ -58,7 +73,7 @@ def main():
         if args.weights:
             parser.error('use --weights or --lookahead, not both')
         policy, trained_with = load_lookahead(args.lookahead)
-        changed = [k for k, v in trained_with.items() if DEFAULTS.get(k) != v]
+        changed = [k for k in DEFAULTS if trained_with.get(k) != DEFAULTS[k]]
         if changed:
             print(f'WARNING: pure pursuit settings changed since training: {changed}')
         w, b = policy['w'], policy['b']
@@ -111,6 +126,8 @@ def main():
 
     name = (f'residual {args.weights}' if args.weights else
             f'dynamic lookahead {args.lookahead}' if args.lookahead else 'pure pursuit only')
+    name += (f', tuned speed table {args.speed_table}' if args.speed_table else
+             ', speed table' if DEFAULTS['use_speed_table'] else ', pure pursuit speed limits')
     print(f'\n{name}'
           f'  ({time.time() - started:.0f} s of computer time)\n')
     print('delay   laps   best timed lap   10-lap total   wall contacts (time touching)')

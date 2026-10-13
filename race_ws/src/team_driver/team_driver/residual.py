@@ -1,4 +1,4 @@
-"""The learned parts. Two ways for reinforcement learning to help pure pursuit:
+"""The learned parts. Three ways for reinforcement learning to help pure pursuit:
 
 1. Residual (first half of this file): pure pursuit decides (steering, speed)
    as usual, and a small neural network adds a correction on top. The
@@ -10,6 +10,9 @@
    Pursuit for Autonomous Racing" (arXiv 2603.28625): the policy chooses
    only pure pursuit's lookahead distance L, from 5 inputs. Here the policy
    is linear, 5 weights and a bias, so what it learned can be read off.
+
+3. Speed table (third section): the policy IS the speed table, one speed per
+   racing-line point, starting from raceline.speed_table and tuned by PPO.
 
 Like pure_pursuit.py, every function takes `xp` (numpy in the driver,
 jax.numpy in training), so training and racing compute the network's
@@ -164,7 +167,8 @@ def gaussian_log_prob(action, mean, log_std, xp=np):
     return -0.5 * (z * z + 2.0 * log_std + xp.log(2.0 * xp.pi))
 
 
-def ppo_policy_loss(log_prob, old_log_prob, advantage, log_std, clip, entropy_coef, xp=np):
+def ppo_policy_loss(log_prob, old_log_prob, advantage, log_std, clip, entropy_coef, xp=np,
+                    weight=None):
     """PPO's loss for the policy (paper eq. 24 and 25, without the critic's
     part, which belongs to training). Gradient descent makes it smaller.
 
@@ -177,13 +181,21 @@ def ppo_policy_loss(log_prob, old_log_prob, advantage, log_std, clip, entropy_co
     change the policy a little: the "proximal" in PPO. The entropy term
     rewards keeping some randomness, so the policy keeps exploring.
 
+    weight    optional, one per sample: 1 if it counts, 0 if it does not (the
+              speed table only learns from cars inside the stretch being
+              tuned). Leave it out and every sample counts.
+
     Returns (loss, kl). kl estimates how far the policy has moved; training
     stops an update early if it moves too far."""
+    if weight is None:
+        average = xp.mean
+    else:
+        average = lambda x: xp.sum(weight * x) / xp.maximum(xp.sum(weight), 1.0)
     ratio = xp.exp(log_prob - old_log_prob)
     clipped = xp.clip(ratio, 1.0 - clip, 1.0 + clip)
-    surrogate = xp.mean(xp.minimum(ratio * advantage, clipped * advantage))
+    surrogate = average(xp.minimum(ratio * advantage, clipped * advantage))
     entropy = xp.sum(log_std + 0.5 * (1.0 + xp.log(2.0 * xp.pi)))
-    kl = xp.mean((ratio - 1.0) - (log_prob - old_log_prob))
+    kl = average((ratio - 1.0) - (log_prob - old_log_prob))
     return -surrogate - entropy_coef * entropy, kl
 
 
@@ -214,3 +226,55 @@ def load_lookahead(path):
     base_params = dict(zip(data['base_param_names'].tolist(),
                            data['base_param_values'].tolist()))
     return policy, base_params
+
+
+# ======================================================================
+# 3. Speed table: one learned speed per racing-line point
+# ======================================================================
+#
+# The policy is the table itself: `speeds`, one number per point, read off
+# at the point nearest the car (exactly like pure_pursuit's speed_table
+# argument). Training starts from raceline.speed_table and lets PPO move
+# each number; training/train.py --method speed_table explains how.
+
+
+def speed_table_inputs(curvature, nearest, speed, xp=np):
+    """What the critic sees for one car (training only; the table itself
+    needs no inputs): the 5 lookahead inputs, plus where on the lap the car
+    is, as a point on a circle (sin, cos) so the end of the lap sits next to
+    the start."""
+    n = curvature.shape[0]
+    angle = 2.0 * xp.pi * nearest / n
+    return xp.concatenate([lookahead_inputs(curvature, nearest, speed, xp),
+                           xp.stack([xp.sin(angle), xp.cos(angle)])])
+
+
+def speed_table_loss(speeds, log_std, point, chosen, old_log_prob, advantage, weight,
+                     clip, entropy_coef, xp=np):
+    """The loss for the speed table, for a batch of samples.
+
+    speeds        (points,) the table: what training changes
+    log_std       log of the exploration spread [m/s]: training changes it too
+    point         (samples,) the path point the car was nearest to
+    chosen        (samples,) the speed it was sent, noise included
+    old_log_prob  how likely that speed was when it was sent
+    advantage     how much better than expected it went
+    weight        (samples,) 1 for cars inside the stretch being tuned, else 0
+
+    The table's speed at `point` is the centre of the bell curve the speed
+    was drawn from, so the gradient lands only on the points that were
+    driven past: each speed learns from the cars that used it."""
+    log_prob = gaussian_log_prob(chosen, speeds[point], log_std, xp)
+    return ppo_policy_loss(log_prob, old_log_prob, advantage, log_std, clip, entropy_coef,
+                           xp, weight)
+
+
+def load_speed_table(path):
+    """Read a speed_table.npz written by training/train.py (numpy only).
+    Returns (speeds, line, base_params): one speed per point, the racing line
+    it was tuned on (the driver checks it is still the same line), and the
+    pure pursuit tuning it was trained with."""
+    data = np.load(path)
+    base_params = dict(zip(data['base_param_names'].tolist(),
+                           data['base_param_values'].tolist()))
+    return data['speeds'], data['line'], base_params

@@ -1,18 +1,21 @@
 """Train a policy with PPO, on the GPU, in the training simulator.
 
-Two kinds of policy (both in race_ws/src/team_driver/team_driver/residual.py):
+Three kinds of policy (all in race_ws/src/team_driver/team_driver/residual.py):
     --method lookahead   (default) a linear policy, L = b + w . s, picks pure
                          pursuit's lookahead distance from 5 inputs
                          (Elgouhary & El-Wakeel 2026, arXiv 2603.28625)
     --method residual    a neural network corrects pure pursuit's steering and speed
+    --method speed_table tunes the speed table (raceline.speed_table), one
+                         speed per racing-line point; see "The speed table" below
 
     python training/train.py --smoke      # 2-minute check that everything runs
     python training/train.py              # a real run, roughly 10 minutes
     python training/train.py --method residual
+    python training/train.py --method speed_table
 
 Every run writes to training/runs/<date-time>/:
-    lookahead.npz (or residual.npz)   the policy, rewritten every 20 updates,
-                                      so a stopped run still leaves usable weights
+    lookahead.npz (or residual.npz,   the policy, rewritten every 20 updates,
+    speed_table.npz)                  so a stopped run still leaves usable weights
     log.csv                           one row per update, for plotting
     args.json                         the settings used, so the run can be repeated
 
@@ -37,6 +40,24 @@ The lookahead method uses the paper's PPO settings (section III-J): discount
 value weight 0.6, learning rate 2.3927e-4 falling linearly to 0. The
 residual keeps the settings it was set up with.
 
+The speed table (--method speed_table). The policy is the table: 380
+numbers, starting from the one raceline.speed_table works out from mu and
+a_brake. Each update tunes one random stretch of WINDOW (60) consecutive
+points, 12 m of line:
+  - Only cars inside the stretch explore. Each gets one random speed offset
+    per NOISE_SEGMENT (10) points, held for the whole update: a change of
+    speed command lasting one 0.01 s step barely changes the car's speed (the
+    simulator eases towards it), but one held for 2 m does. Cars elsewhere
+    drive the table as it is.
+  - Only their samples count in the policy loss, and only the stretch's 60
+    speeds may change. The critic learns from every car.
+  - After the update the table is clipped to SPEED_RANGE and lowered wherever
+    neighbouring points break the speed-change rule
+    (raceline.limit_speed_changes), so it keeps to the same rule it started from.
+Because each update's stretch starts at a random point, the 2 m pieces line
+up differently every time, and over many updates every point is tuned on its
+own. Steering is pure pursuit with its own lookahead rule.
+
 The advantage and loss code follows external/f1tenth_gym/examples/
 jax_ppo_training.py (MIT licence), which in turn follows PureJaxRL.
 """
@@ -56,10 +77,11 @@ import numpy as np
 
 import sim
 from team_driver.pure_pursuit import DEFAULTS
+from team_driver.raceline import lap_time, limit_speed_changes, speed_table
 from team_driver.residual import (
     FEATURE_NAMES, LIMITS, LOOKAHEAD_INPUTS, LOOKAHEAD_RANGE, NUM_FEATURES, START_BIAS,
     START_WEIGHTS, actor, apply_residual, gaussian_log_prob, lookahead, lookahead_loss,
-    ppo_policy_loss)
+    path_geometry, ppo_policy_loss, speed_table_loss, load_speed_table)
 
 COLLISION_PENALTY = 10.0   # reward lost on touching a wall [metres of progress]
 RESIDUAL_COST = 0.002      # residual only: per step, times the squared size of the correction
@@ -67,12 +89,24 @@ MAX_GRAD_NORM = 0.5        # gradients longer than this are shrunk (see clip_by_
 STALL_SPEED = 0.05         # [m/s] slower than this counts as standing still (the paper's value)
 STALL_STEPS = 50           # stalled = standing still for longer than this many steps (0.5 s)
 
+# Speed table only (see "The speed table" above).
+WINDOW = 60                # consecutive points tuned per update (12 m of line)
+NOISE_SEGMENT = 10         # a car's exploration offset is held for this many points (2 m)
+SPEED_RANGE = (1.0, 15.0)  # [m/s] tuned speeds are kept inside this
+SPEED_TABLE_INPUTS = 7     # what its critic sees: residual.speed_table_inputs
+
 # PPO settings for each method; any of them can be overridden on the command line.
 SETTINGS = {
     'lookahead': dict(steps=20e6, epochs=5, minibatches=32, lr=2.3927e-4, lr_decay=True,
                       gamma=0.99, gae_lambda=0.98, entropy=0.02, value_coef=0.6, target_kl=0.015),
     'residual': dict(steps=50e6, epochs=4, minibatches=8, lr=3e-4, lr_decay=False,
                      gamma=0.995, gae_lambda=0.95, entropy=0.0, value_coef=0.5, target_kl=None),
+    # Each point is only in the window about 1 update in 6, so it needs more
+    # steps, and a larger learning rate than the lookahead's 5 weights. The
+    # exploration spread is fixed for this method (see loss()), so entropy
+    # does nothing here.
+    'speed_table': dict(steps=40e6, epochs=5, minibatches=32, lr=1e-3, lr_decay=True,
+                        gamma=0.99, gae_lambda=0.95, entropy=0.0, value_coef=0.5, target_kl=0.015),
 }
 
 
@@ -92,6 +126,9 @@ class Sample(NamedTuple):
                                # lookahead: the clipped L)
     l_change: jax.Array        # lookahead: |L - previous L| [m] (residual: 0)
     stalled: jax.Array         # lookahead: standing still too long (residual: False)
+    point: jax.Array           # speed table: the path point the car was nearest to (others: 0)
+    weight: jax.Array          # 1 if the sample counts in the policy loss, else 0
+                               # (speed table: inside the window; others: always 1)
 
 
 class Minibatch(NamedTuple):
@@ -101,6 +138,8 @@ class Minibatch(NamedTuple):
     log_prob: jax.Array
     advantage: jax.Array       # how much better than expected it went
     ret: jax.Array             # the reward-to-go the critic should have predicted
+    point: jax.Array
+    weight: jax.Array
 
 
 # ----------------------------------------------------------------------
@@ -120,8 +159,15 @@ def network(key, n_in, hidden, n_out, last_scale):
     return weights
 
 
-def init_params(key, method, hidden):
+def init_params(key, method, hidden, speeds=None):
+    """Starting weights. `speeds` is the starting table for the speed table."""
     k_actor, k_critic = jax.random.split(key)
+    if method == 'speed_table':
+        return {
+            'actor': {'speeds': jnp.asarray(speeds, dtype=jnp.float32)},
+            'critic': network(k_critic, SPEED_TABLE_INPUTS, hidden, 1, 1.0),
+            'log_std': jnp.asarray(math.log(0.3)),      # explore about +-0.3 m/s
+        }
     if method == 'lookahead':
         return {
             'actor': {'w': jnp.asarray(START_WEIGHTS), 'b': jnp.asarray(START_BIAS)},
@@ -212,8 +258,18 @@ def make_update(simulator, path, args, updates):
     batch = args.envs * args.rollout
     minibatch = batch // args.minibatches
     limits = jnp.asarray(LIMITS)
-    controller = sim.make_controller(path)
-    inputs, drive = sim.make_lookahead_controller(path)
+    points = len(path)
+    # The speed table to drive by: --speed-table if given (e.g. the tuned one
+    # the driver races with), else whatever the driver would build from
+    # DEFAULTS. Either way scaled by DEFAULTS['table_scale'], as in the race.
+    speeds = None
+    if args.speed_table:
+        speeds, line, _ = load_speed_table(args.speed_table)
+        if line.shape != path.shape or not np.allclose(line, path, atol=1e-3):
+            raise SystemExit(f'{args.speed_table} was tuned on a different racing line')
+    controller = sim.make_controller(path, speeds)
+    inputs, drive = sim.make_lookahead_controller(path, speeds)
+    observe, steer_only = sim.make_speed_table_controller(path)
 
     def step_simulator(carry, steer, speed, key):
         """Send the commands (after the reaction delay) and step every car."""
@@ -232,17 +288,19 @@ def make_update(simulator, path, args, updates):
         return out, (out.state, out.next_observation, last_steer, queue, delay)
 
     def sample(params, x, x_end, action, log_prob, reward, out, used,
-               l_change=None, stalled=None):
+               l_change=None, stalled=None, point=None, weight=None):
         if l_change is None:
             l_change, stalled = jnp.zeros(cars), jnp.zeros(cars, dtype=bool)
-        return Sample(l_change=l_change, stalled=stalled,
+        if point is None:
+            point, weight = jnp.zeros(cars, dtype=jnp.int32), jnp.ones(cars)
+        return Sample(l_change=l_change, stalled=stalled, point=point, weight=weight,
             inputs=x, action=action, log_prob=log_prob,
             value=critic(params['critic'], x), reward=reward,
             terminated=out.metrics.status.terminated, truncated=out.metrics.status.truncated,
             end_value=critic(params['critic'], x_end),
             progress=out.metrics.episode.progress[:, 0], used=used)
 
-    def drive_lookahead(params, carry, key):
+    def drive_lookahead(params, carry, key, window):
         k_noise, k_sim = jax.random.split(key)
         previous_l, still = carry[5], carry[6]                # still = steps spent standing still
         s = inputs(carry[1])                                  # (cars, 5)
@@ -274,7 +332,7 @@ def make_update(simulator, path, args, updates):
             params, s, inputs(out.transition_observation), chosen, log_prob,
             reward, out, distance, l_change, stalled)
 
-    def drive_residual(params, carry, key):
+    def drive_residual(params, carry, key, window):
         k_noise, k_sim = jax.random.split(key)
         base_steer, base_speed, x = controller(carry[1], carry[2])
         mean = actor(params['actor'], x, xp=jnp)
@@ -289,7 +347,26 @@ def make_update(simulator, path, args, updates):
         log_prob = jnp.sum(gaussian_log_prob(action, mean, params['log_std'], xp=jnp), axis=-1)
         return core + carry[5:], sample(params, x, x_end, action, log_prob, reward, out, squashed)
 
-    drive_one_step = drive_lookahead if args.method == 'lookahead' else drive_residual
+    def drive_speed_table(params, carry, key, window):
+        """Cars inside the window get the table's speed plus their own offset
+        for the 2 m piece they are in; every other car drives the table as it is."""
+        start, offsets = window
+        x, point = observe(carry[1])
+        mean = params['actor']['speeds'][point]
+        into = (point - start) % points                       # how far into the window
+        inside = into < WINDOW
+        offset = offsets[jnp.arange(cars), jnp.minimum(into // NOISE_SEGMENT, offsets.shape[1] - 1)]
+        chosen = jnp.where(inside, mean + offset, mean)
+        speed = jnp.clip(chosen, *SPEED_RANGE)
+        out, core = step_simulator(carry, steer_only(carry[1]), speed, key)
+        x_end, _ = observe(out.transition_observation)
+        log_prob = gaussian_log_prob(chosen, mean, params['log_std'], xp=jnp)
+        return core + carry[5:], sample(
+            params, x, x_end, chosen, log_prob, out.rewards[:, 0], out, speed,
+            point=point, weight=inside.astype(jnp.float32))
+
+    drive_one_step = {'lookahead': drive_lookahead, 'residual': drive_residual,
+                      'speed_table': drive_speed_table}[args.method]
 
     def loss(params, mb):
         """The loss gradient descent makes smaller: the policy's (residual.py)
@@ -298,6 +375,13 @@ def make_update(simulator, path, args, updates):
             policy_loss, kl = lookahead_loss(
                 params['actor'], params['log_std'], mb.inputs, mb.action, mb.log_prob,
                 mb.advantage, args.clip, args.entropy, xp=jnp)
+        elif args.method == 'speed_table':
+            # The exploration spread stays fixed (stop_gradient: no gradient,
+            # so Adam never moves it). Learned, PPO shrinks it to nothing
+            # within a run and the table stops exploring halfway through.
+            policy_loss, kl = speed_table_loss(
+                params['actor']['speeds'], jax.lax.stop_gradient(params['log_std']), mb.point,
+                mb.action, mb.log_prob, mb.advantage, mb.weight, args.clip, args.entropy, xp=jnp)
         else:
             mean = actor(params['actor'], mb.inputs, xp=jnp)
             log_prob = jnp.sum(gaussian_log_prob(mb.action, mean, params['log_std'], xp=jnp), axis=-1)
@@ -310,17 +394,37 @@ def make_update(simulator, path, args, updates):
         params, adam, carry, key, index = runner
         key, k_drive, k_shuffle = jax.random.split(key, 3)
 
+        # Speed table only: this update's window (its first point), the
+        # points in it, and each car's offset for each 2 m piece of it.
+        start = offsets = tuned = speeds_before = None
+        if args.method == 'speed_table':
+            k_drive, k_window, k_offsets = jax.random.split(k_drive, 3)
+            start = jax.random.randint(k_window, (), 0, points)
+            tuned = (jnp.arange(points) - start) % points < WINDOW
+            offsets = jnp.exp(params['log_std']) * jax.random.normal(
+                k_offsets, (cars, WINDOW // NOISE_SEGMENT))
+            speeds_before = params['actor']['speeds']
+
         # 1. Drive: `rollout` steps for every car.
         carry, samples = jax.lax.scan(
-            lambda c, k: drive_one_step(params, c, k), carry,
+            lambda c, k: drive_one_step(params, c, k, (start, offsets)), carry,
             jax.random.split(k_drive, args.rollout))
 
-        # 2. Score every step against the critic's expectation.
+        # 2. Score every step against the critic's expectation, then rescale
+        #    the advantages to average 0 and spread 1 over the samples that
+        #    count (for the speed table, only those inside the window).
         advantage, ret = advantages_and_returns(samples, args.gamma, args.gae_lambda)
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        if args.method == 'speed_table':
+            w = samples.weight
+            count = jnp.maximum(jnp.sum(w), 1.0)
+            average = jnp.sum(w * advantage) / count
+            spread = jnp.sqrt(jnp.sum(w * (advantage - average) ** 2) / count)
+            advantage = (advantage - average) / (spread + 1e-8)
+        else:
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
         flat = jax.tree.map(lambda a: a.reshape((batch,) + a.shape[2:]), samples)
         data = Minibatch(flat.inputs, flat.action, flat.log_prob,
-                         advantage.reshape(batch), ret.reshape(batch))
+                         advantage.reshape(batch), ret.reshape(batch), flat.point, flat.weight)
 
         # 3. Learn: a few passes over the data in shuffled minibatches.
         #    With lr_decay the learning rate falls in a straight line to 0
@@ -336,6 +440,12 @@ def make_update(simulator, path, args, updates):
             if args.target_kl is not None:
                 stopped = stopped | (kl > 1.5 * args.target_kl)
             new_params, new_adam = adam_step(params, clip_by_global_norm(grads, MAX_GRAD_NORM), adam, lr)
+            if args.method == 'speed_table':
+                # Only the window's speeds may change. (Points outside it get
+                # no gradient, but Adam's running average from earlier
+                # updates would still nudge them.)
+                new_params = {**new_params, 'actor': {'speeds': jnp.where(
+                    tuned, new_params['actor']['speeds'], params['actor']['speeds'])}}
             keep_old = lambda new, old: jax.tree.map(lambda a, b: jnp.where(stopped, b, a), new, old)
             return (keep_old(new_params, params), keep_old(new_adam, adam), stopped), (value_loss, kl)
 
@@ -364,6 +474,12 @@ def make_update(simulator, path, args, updates):
             metrics['L_mean'] = jnp.mean(samples.used)
             metrics['L_change'] = jnp.mean(samples.l_change)
             metrics['stalled'] = jnp.mean(samples.stalled)
+        elif args.method == 'speed_table':
+            change = params['actor']['speeds'] - speeds_before
+            metrics['window_start'] = start.astype(jnp.float32)
+            metrics['inside'] = jnp.mean(samples.weight)              # share of samples in the window
+            metrics['window_change'] = jnp.sum(jnp.abs(change)) / WINDOW   # mean |change| [m/s]
+            metrics['window_shift'] = jnp.sum(change) / WINDOW             # mean change, signed
         else:
             metrics['steer_fix'] = jnp.mean(jnp.abs(samples.used[..., 0])) * LIMITS[0]
             metrics['speed_fix'] = jnp.mean(jnp.abs(samples.used[..., 1])) * LIMITS[1]
@@ -375,8 +491,10 @@ def make_update(simulator, path, args, updates):
 # ----------------------------------------------------------------------
 # Saving and loading
 # ----------------------------------------------------------------------
-def save(path, params, args):
-    """Write the policy so the driver can load it with numpy alone."""
+def save(path, params, args, line=None):
+    """Write the policy so the driver can load it with numpy alone.
+    `line` is the racing line (speed table only: saved with it, so the driver
+    can check the table still fits the line it builds)."""
     common = dict(
         log_std=np.asarray(params['log_std']),
         **{'critic_' + k: np.asarray(v) for k, v in params['critic'].items()},
@@ -387,6 +505,9 @@ def save(path, params, args):
         np.savez(path, w=np.asarray(params['actor']['w']), b=np.asarray(params['actor']['b']),
                  input_names=np.array(LOOKAHEAD_INPUTS),
                  lookahead_range=np.asarray(LOOKAHEAD_RANGE), **common)
+    elif args.method == 'speed_table':
+        np.savez(path, speeds=np.asarray(params['actor']['speeds'], dtype=float),
+                 line=np.asarray(line), speed_range=np.asarray(SPEED_RANGE), **common)
     else:
         np.savez(path, **{k: np.asarray(v) for k, v in params['actor'].items()},
                  limits=np.asarray(LIMITS), feature_names=np.array(FEATURE_NAMES), **common)
@@ -398,11 +519,25 @@ def load_params(path, method):
     names = ('W0', 'b0', 'W1', 'b1', 'W2', 'b2')
     if method == 'lookahead':
         policy = {'w': jnp.asarray(data['w']), 'b': jnp.asarray(data['b'])}
+    elif method == 'speed_table':
+        policy = {'speeds': jnp.asarray(data['speeds'], dtype=jnp.float32)}
     else:
         policy = {k: jnp.asarray(data[k]) for k in names}
     return {'actor': policy,
             'critic': {k: jnp.asarray(data['critic_' + k]) for k in names},
             'log_std': jnp.asarray(data['log_std'])}
+
+
+def keep_within_rule(params, line, device):
+    """Speed table, after every update: clip the speeds to SPEED_RANGE, then
+    lower them wherever neighbouring points break the speed-change rule
+    (raceline.limit_speed_changes, the same code that built the starting
+    table). Done here in numpy rather than inside the compiled update, so
+    there is only one copy of the rule."""
+    speeds = np.clip(np.asarray(params['actor']['speeds'], dtype=float), *SPEED_RANGE)
+    speeds = limit_speed_changes(line, speeds, DEFAULTS['a_brake'])
+    actor = {'speeds': jax.device_put(jnp.asarray(speeds, dtype=jnp.float32), device)}
+    return {**params, 'actor': actor}, speeds
 
 
 def equation(policy):
@@ -415,7 +550,8 @@ def equation(policy):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--method', choices=('lookahead', 'residual'), default='lookahead')
+    parser.add_argument('--method', choices=('lookahead', 'residual', 'speed_table'),
+                        default='lookahead')
     parser.add_argument('--steps', type=float, help='simulated steps in total')
     parser.add_argument('--envs', type=int, default=2048, help='cars driving in parallel')
     parser.add_argument('--rollout', type=int, default=128, help='steps per car between updates')
@@ -440,10 +576,16 @@ def main():
     parser.add_argument('--w-stall', type=float, default=0.05,
                         help='lookahead reward: cost per step spent stalled')
     parser.add_argument('--init', help='saved policy (.npz) to continue training from')
+    parser.add_argument('--speed-table',
+                        help='lookahead/residual: drive by this speed_table.npz (default: the '
+                             "table the driver would build from DEFAULTS)")
+    parser.add_argument('--max-delay', type=int, default=sim.MAX_DELAY,
+                        help='largest reaction delay [steps]; each car gets 0..this')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', choices=('gpu', 'cpu'), default='gpu')
     parser.add_argument('--smoke', action='store_true', help='tiny run to check the setup works')
     args = parser.parse_args()
+    sim.MAX_DELAY = args.max_delay
     for name, value in SETTINGS[args.method].items():
         if getattr(args, name) is None:
             setattr(args, name, value)
@@ -461,11 +603,19 @@ def main():
     simulator = sim.make_simulator(device, training=True, episode_steps=args.episode_steps,
                                    collision_penalty=COLLISION_PENALTY)
     updates = max(1, int(args.steps // (args.envs * args.rollout)))
-    update = make_update(simulator, sim.racing_line(), args, updates)
+    path = sim.racing_line()
+    update = make_update(simulator, path, args, updates)
 
     key = jax.random.key(args.seed)
     key, k_params, k_reset, k_delay = jax.random.split(key, 4)
-    params = load_params(args.init, args.method) if args.init else init_params(k_params, args.method, args.hidden)
+    start_speeds = None
+    if args.method == 'speed_table':
+        # Start from the table the driver works out from mu and a_brake.
+        start_speeds = speed_table(path, path_geometry(path)[1], DEFAULTS)
+        if args.init and np.load(args.init)['line'].shape != path.shape:
+            parser.error(f'{args.init} was tuned on a different racing line')
+    params = (load_params(args.init, args.method) if args.init
+              else init_params(k_params, args.method, args.hidden, start_speeds))
     observation, env = simulator.reset_batch(jax.random.split(k_reset, args.envs))
     carry = (env, observation, jnp.zeros(args.envs),
              jnp.zeros((args.envs, sim.MAX_DELAY + 1, 2)),
@@ -477,12 +627,21 @@ def main():
           f'The first one compiles, which takes a minute or two.\nSaving to {run_dir}\n')
     if args.method == 'lookahead':
         print(f'start: {equation(params["actor"])}\n')
+    if args.method == 'speed_table':
+        params, speeds = keep_within_rule(params, path, device)
+        runner = (params,) + runner[1:]
+        print(f'start: table lap {lap_time(path, speeds):.2f} s if driven exactly, '
+              f'{WINDOW} of {len(path)} points tuned per update\n')
     with open(run_dir / 'log.csv', 'w', newline='') as log_file:
         log = None
         started = time.time()
         for i in range(1, updates + 1):
             runner, metrics = update(runner)
             m = {k: float(v) for k, v in jax.device_get(metrics).items()}
+            if args.method == 'speed_table':
+                params, speeds = keep_within_rule(runner[0], path, device)
+                runner = (params,) + runner[1:]
+                m['table_lap'] = lap_time(path, speeds)
             if args.method == 'lookahead':
                 policy = jax.device_get(runner[0]['actor'])
                 m.update({f'w_{name}': float(w) for name, w in zip(LOOKAHEAD_INPUTS, policy['w'])})
@@ -506,13 +665,20 @@ def main():
                     line += (f'  L straight {m["L_straight"]:.2f} m, curve {m["L_curve"]:.2f} m'
                              f'  stalled {100 * m["stalled"]:.1f}%'
                              f'\n       {equation(policy)}')
+                elif args.method == 'speed_table':
+                    first = int(m['window_start'])
+                    line += (f'  window {first}-{(first + WINDOW - 1) % len(path)}'
+                             f' ({100 * m["inside"]:.0f}% of cars)'
+                             f'  change {m["window_shift"]:+.3f} m/s (|{m["window_change"]:.3f}|)'
+                             f'  table lap {m["table_lap"]:.2f} s')
                 else:
                     line += f'  |steer fix| {m["steer_fix"]:.3f} rad  |speed fix| {m["speed_fix"]:.2f} m/s'
                 print(line)
             if i % 20 == 0 or i == updates:
-                save(out_file, runner[0], args)
+                save(out_file, runner[0], args, path)
 
-    flag = '--lookahead' if args.method == 'lookahead' else '--weights'
+    flag = {'lookahead': '--lookahead', 'residual': '--weights',
+            'speed_table': '--speed-table'}[args.method]
     print(f'\nDone. Policy: {out_file}\nNext: python training/evaluate.py {flag} {out_file}')
 
 

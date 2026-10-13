@@ -35,6 +35,11 @@ DEFAULTS = {
     'min_lookahead': 0.5,    # [m]     ... but never shorter than this
     'wheelbase': 0.33,       # [m]
     'max_steer': 0.4189,     # [rad]
+    'use_speed_table': True, # True: speed from raceline.speed_table (built from mu
+                             # and a_brake); False: the three limits in step 7
+    'table_scale': 1.0,      #         speed table only: every speed in the table
+                             #         (tuned or not) is multiplied by this. Below 1
+                             #         leaves room for a slow ROS reaction (headless)
 }
 
 G = 9.81                     # [m/s^2] gravity
@@ -48,7 +53,8 @@ def preprocess(ranges, max_range, xp=np):
     return xp.clip(ranges, 0.0, max_range)
 
 
-def pure_pursuit(path, car, yaw, speed, ranges, angles, params, xp=np, lookahead=None):
+def pure_pursuit(path, car, yaw, speed, ranges, angles, params, xp=np, lookahead=None,
+                 speed_table=None):
     """Decide the steering angle and speed for one car.
 
     Inputs
@@ -60,6 +66,8 @@ def pure_pursuit(path, car, yaw, speed, ranges, angles, params, xp=np, lookahead
         params   the tuning table: DEFAULTS, or the driver's ROS parameters
         lookahead  [m] how far ahead to aim; leave it out to use the speed rule
                    in step 2 (a learned policy can choose it: residual.lookahead)
+        speed_table  one speed [m/s] per path point (raceline.speed_table); leave
+                   it out to use the three limits in step 7 instead
 
     Returns (steering [rad], speed [m/s], nearest, ahead). The last two are
     the index of the path point closest to the car and the free distance
@@ -95,12 +103,19 @@ def pure_pursuit(path, car, yaw, speed, ranges, angles, params, xp=np, lookahead
     steering = xp.arctan(params['wheelbase'] * curvature)
     steering = xp.clip(steering, -params['max_steer'], params['max_steer'])
 
-    # 6. Speed: the smallest of three limits.
-    #    a) Braking. `ahead` is the shortest LiDAR beam in a narrow cone in
-    #       front. Stopping from speed v takes v^2 / (2 * a_brake) metres, so
-    #       the fastest speed that can still stop `margin` short of the wall is:
+    # 6. The free distance straight ahead: the shortest LiDAR beam in a
+    #    narrow cone in front.
     in_cone = xp.abs(angles) < math.radians(params['ahead_angle'])
     ahead = xp.min(xp.where(in_cone, ranges, params['max_range']))
+
+    # 7. Speed. With a speed table, worked out once at startup, just read off
+    #    the speed for this point of the line.
+    if speed_table is not None:
+        return steering, speed_table[nearest], nearest, ahead
+
+    #    Without one, the smallest of three limits.
+    #    a) Braking. Stopping from speed v takes v^2 / (2 * a_brake) metres, so
+    #       the fastest speed that can still stop `margin` short of the wall is:
     v_brake = xp.sqrt(2.0 * params['a_brake'] * xp.maximum(ahead - params['margin'], 0.0))
 
     #    b) Cornering. On a curve the tyres grip at most mu * g sideways, and

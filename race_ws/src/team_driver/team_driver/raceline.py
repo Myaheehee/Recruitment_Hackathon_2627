@@ -11,6 +11,9 @@ exactly what a bend-minimising line looks like.
       slide_limits()        step 2: how far each point may slide
       minimise_bending()    step 3: slide the points
       resample()            step 4: space the points evenly again
+    speed_table()           a target speed for every point of the line
+      limit_speed_changes() its rule for neighbouring points
+    lap_time()              how long a lap takes at those speeds
     load_clearance_map()    how far any point is from the nearest wall
 
 No ROS in here, so the training code (training/) can build the same line.
@@ -22,6 +25,8 @@ import numpy as np
 import yaml
 from PIL import Image
 from scipy import ndimage
+
+from team_driver.pure_pursuit import G, MIN_CURVATURE
 
 CAR_HALF_WIDTH = 0.155   # [m] the car is 0.31 m wide (docs/02-simulator.md, 2.8)
 WALL_GAP = 0.2           # [m] air to keep between the car's side and a wall
@@ -135,6 +140,60 @@ def resample(points, spacing):
     # np.interp reads off x, then y, at each wanted distance.
     return np.stack([np.interp(wanted, distance, closed[:, 0]),
                      np.interp(wanted, distance, closed[:, 1])], axis=1)
+
+
+def speed_table(path, curvature, params):
+    """The fastest speed [m/s] at each point of the closed `path`, one per point.
+
+    curvature  how sharply the line bends at each point [1/m]
+               (residual.path_geometry works it out)
+    params     uses mu and a_brake from the tuning table
+
+    Two rules, and no top speed: on a straight only rule 2 limits the speed.
+    1. Corners. At each point on its own: no faster than the cornering limit
+       sqrt(mu * g / |curvature|) from pure_pursuit.py.
+    2. Neighbours. Between two points d metres apart, the speed may change by
+       at most 2 * a_brake * d / (v + v_next), speeding up or slowing down.
+       Multiplied out, (v_next - v) * (v_next + v) = v_next^2 - v^2, so this
+       is v_next^2 <= v^2 + 2 * a_brake * d: the distance needed to change
+       speed at a_brake.
+    Rule 2 is limit_speed_changes(), below.
+    """
+    corner = np.sqrt(params['mu'] * G / np.maximum(np.abs(curvature), MIN_CURVATURE))
+    return limit_speed_changes(path, corner, params['a_brake'])
+
+
+def limit_speed_changes(path, speeds, a_brake):
+    """Lower the speeds of the closed `path` where needed, so that between
+    any two neighbouring points the speed changes by at most
+    2 * a_brake * d / (v + v_next). Speeds are only ever lowered.
+
+    Done by walking round the lap forwards (how fast can the car be here,
+    having sped up from the point before?) and then backwards (how fast can
+    it be here and still slow down in time for the point after?). Training
+    uses it too, to keep a tuned speed table within the rule.
+    """
+    gap = np.linalg.norm(np.roll(path, -1, axis=0) - path, axis=1)   # gap[i]: point i to point i+1
+    v = np.array(speeds, dtype=float)
+    n = len(v)
+    # The lap is a loop, so a slow corner near the end also limits the start.
+    # Keep walking round until a full round changes nothing (2-3 rounds).
+    while True:
+        before = v.copy()
+        for i in range(n):                    # forwards: speeding up
+            v[i] = min(v[i], np.sqrt(v[i - 1] ** 2 + 2.0 * a_brake * gap[i - 1]))
+        for i in reversed(range(n)):          # backwards: slowing down
+            after = (i + 1) % n
+            v[i] = min(v[i], np.sqrt(v[after] ** 2 + 2.0 * a_brake * gap[i]))
+        if np.array_equal(v, before):
+            return v
+
+
+def lap_time(path, speeds):
+    """Seconds for one lap of the closed `path` at these speeds: each gap
+    between points takes its length divided by the average of its two ends."""
+    gap = np.linalg.norm(np.roll(path, -1, axis=0) - path, axis=1)
+    return float(np.sum(gap / (0.5 * (speeds + np.roll(speeds, -1)))))
 
 
 def load_clearance_map(map_yaml):

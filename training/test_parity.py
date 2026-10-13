@@ -11,6 +11,11 @@
 4. The dynamic-lookahead policy: numpy and jax.numpy agree on its 5 inputs,
    on L, on pure pursuit aiming L ahead, and on the loss; JAX's gradient of
    the loss matches a numerical one; a saved policy reads back correctly.
+5. The speed table keeps to its rules: neighbouring speeds differ by at most
+   2 * a_brake * d / (v + v_next), and no point beats its cornering limit.
+   Its training loss agrees in numpy and jax, its gradient matches a numerical
+   one and lands only on the points driven past inside the window, and a
+   tuned table reads back correctly.
 
 If any of these fail, a network trained here would be racing a different
 controller from the one it learned to correct.
@@ -28,10 +33,11 @@ import jax.numpy as jnp
 import numpy as np
 
 import sim
-from team_driver.pure_pursuit import DEFAULTS, pure_pursuit
+from team_driver.pure_pursuit import DEFAULTS, G, pure_pursuit
+from team_driver.raceline import speed_table
 from team_driver.residual import (
-    actor, features, load_lookahead, load_weights, lookahead, lookahead_inputs, lookahead_loss,
-    path_geometry)
+    actor, features, load_lookahead, load_speed_table, load_weights, lookahead, lookahead_inputs,
+    lookahead_loss, path_geometry, speed_table_loss)
 import train
 
 ORIGINAL = '0c2a770'      # last commit with plan() written out inside driver.py
@@ -179,6 +185,63 @@ def main():
     assert np.array_equal(loaded['w'], np.asarray(lparams['actor']['w']))
     assert trained_with == DEFAULTS
     print(f'   save -> load round trip OK, starting {train.equation(lparams["actor"])}')
+
+    # 5. Speed table. np.roll(x, -1)[i] is the next point, wrapping round the lap.
+    speeds = speed_table(path, curvature, DEFAULTS)
+    after = np.roll(speeds, -1)
+    gap = np.linalg.norm(np.roll(path, -1, axis=0) - path, axis=1)
+    allowed = 2.0 * DEFAULTS['a_brake'] * gap / (speeds + after)
+    corner = np.sqrt(DEFAULTS['mu'] * G / np.abs(curvature))
+    print(f'5. speed table: largest step {np.max(np.abs(after - speeds) - allowed):+.1e} m/s '
+          f'beyond the limit (want <= 0), {np.sum(speeds > corner + 1e-9)} points too fast for '
+          f'their corner, top {speeds.max():.2f} m/s')
+    assert np.all(np.abs(after - speeds) <= allowed + 1e-9)
+    assert np.all(speeds <= corner + 1e-9)
+    # pure_pursuit() reads it off at the nearest point, the same in numpy and jax.
+    for _ in range(100):
+        s = random_situation(rng, path, angles)
+        command = pure_pursuit(path, s['car'], s['yaw'], s['speed'], s['ranges'], angles,
+                               DEFAULTS, speed_table=speeds)
+        jcommand = pure_pursuit(j['path'], jnp.asarray(s['car']), s['yaw'], s['speed'],
+                                jnp.asarray(s['ranges']), j['angles'], DEFAULTS, xp=jnp,
+                                speed_table=jnp.asarray(speeds))
+        assert command[1] == speeds[command[2]]
+        assert abs(command[1] - float(jcommand[1])) < 1e-3 and command[2] == int(jcommand[2])
+    print('   pure_pursuit() with the speed table: numpy and jax agree')
+
+    # Its training loss. Samples at random points; only some are inside the window.
+    point = rng.integers(len(path), size=256)
+    chosen = speeds[point] + rng.normal(0, 0.3, 256)
+    weight = (rng.uniform(size=256) < 0.3).astype(float)
+    args = (np.log(0.3), point, chosen, rng.normal(-0.5, 0.1, 256), rng.normal(size=256),
+            weight, 0.2, 0.0)
+    numpy_loss, _ = speed_table_loss(speeds, *args)
+    jax_args = tuple(jnp.asarray(a) for a in args)
+    jax_loss, _ = speed_table_loss(jnp.asarray(speeds), *jax_args, xp=jnp)
+    gradient = np.asarray(jax.grad(lambda v: speed_table_loss(v, *jax_args, xp=jnp)[0])(
+        jnp.asarray(speeds)))
+    counted = np.zeros(len(path), dtype=bool)
+    counted[point[weight > 0]] = True
+    worst = {'loss': abs(numpy_loss - float(jax_loss)), 'gradient': 0.0}
+    for i in np.flatnonzero(counted)[:10]:
+        step = np.zeros(len(path))
+        step[i] = 1e-6
+        numerical = (speed_table_loss(speeds + step, *args)[0]
+                     - speed_table_loss(speeds - step, *args)[0]) / 2e-6
+        worst['gradient'] = max(worst['gradient'], abs(gradient[i] - numerical))
+    print('   speed table loss, numpy vs jax: ' + ', '.join(f'{k} {v:.1e}' for k, v in worst.items())
+          + f'; gradient on {np.count_nonzero(gradient)} points, all inside the window')
+    assert all(v < 1e-3 for v in worst.values()), worst
+    assert not np.any(gradient[~counted]), 'gradient outside the samples that count'
+
+    with tempfile.TemporaryDirectory() as tmp:
+        file = f'{tmp}/speed_table.npz'
+        sparams = train.init_params(jax.random.key(3), 'speed_table', 16, speeds)
+        train.save(file, sparams, Namespace(method='speed_table'), path)
+        loaded, line, trained_with = load_speed_table(file)
+    assert np.allclose(loaded, speeds, atol=1e-5) and np.array_equal(line, path)
+    assert trained_with == DEFAULTS
+    print('   speed table save -> load round trip OK')
     print('\nAll parity checks passed.')
 
 

@@ -29,8 +29,10 @@ pure pursuit, exactly as before.
 | `race_ws/src/team_driver/team_driver/residual.py` | The network's inputs (`features`), the network (`actor`), `LIMITS`, and how the correction is added. |
 | `race_ws/src/team_driver/models/residual.npz` | The trained network the driver loads. Absent = pure pursuit only. |
 | `training/sim.py` | The GPU simulator set up like the judged race, with the controller running inside it. |
-| `training/train.py` | PPO training, with Adam written out. `--method lookahead` (default) or `--method residual`. |
+| `training/train.py` | PPO training, with Adam written out. `--method lookahead` (default), `residual` or `speed_table`. |
 | `training/evaluate.py` | Races 11 laps in the simulator at every reaction delay and prints lap times and contacts. |
+| `training/speed_table.py` | Prints and draws the speed table (`training/speed_table.csv`, `.png`). |
+| `race_ws/src/team_driver/models/speed_table.npz` | A tuned speed table the driver loads. Absent = the table from `mu` and `a_brake`. |
 | `training/test_parity.py` | Checks training and racing compute exactly the same thing. |
 | `training/runs/` | Output of each training run (not committed). |
 
@@ -105,7 +107,7 @@ L = b + w_v*v + w_0*|k0| + w_1*|k1| + w_2*|k2| + w_d*dk     clipped to 0.35..4.0
 | `|k0|`, `|k1|`, `|k2|` | how sharply the racing line bends at the nearest point, 1 m and 3 m further on [1/m] |
 | `dk` | `|k1| - |k0|`: is the bend ahead tightening (+) or opening (-)? |
 
-Training starts from `L = 0.4*v`, close to the hand-made rule, and PPO
+Training starts from `L = lookahead_gain * v` (0.25), the hand-made rule, and PPO
 adjusts the 5 weights and the bias. Where the code is:
 
 - `residual.py`: the inputs (`lookahead_inputs`), the policy (`lookahead`),
@@ -145,6 +147,56 @@ curvature terms; its curvature horizons are not given, so 1 m and 3 m are
 ours; L is not smoothed before use; and every episode
 gets a random reaction delay (below).
 
+## The speed table (the third method)
+
+Since 2026-10-12 the driver's speed comes from a **speed table**: one target
+speed for each of the 380 racing-line points (0.2 m apart), read off at the
+point nearest the car. `raceline.speed_table` builds it at startup from two
+rules: no faster than the cornering limit `sqrt(mu * g / |curvature|)`, and
+between neighbouring points the speed may change by at most
+`2 * a_brake * d / (v + v_next)` (`raceline.limit_speed_changes`). There is no
+top speed. The old rule (LiDAR braking, cornering, `v_max`) is still there
+behind `use_speed_table:=false`.
+
+Why: the old rule braked for the outside wall of every corner, which the car
+never reaches, and held the speed down for about two thirds of the lap.
+The table for the current `DEFAULTS` laps in 13.5 s if driven exactly; the
+car manages about 14.5 s at delay 0 and 15.9 s with `mu` 0.8.
+
+`--method speed_table` tunes the table with the same PPO loop. The policy
+**is** the table, 380 numbers, starting from the one above:
+
+- Each update picks a random stretch of `WINDOW` (60) consecutive points, 12 m
+  of line. Only cars inside it explore: each gets a random speed offset per
+  `NOISE_SEGMENT` (10) points, held for the whole update, because a speed
+  command that lasts one 0.01 s step barely moves the car but one held for
+  2 m does. Cars elsewhere drive the table as it is.
+- Only the stretch's samples count in the policy loss (`residual.speed_table_loss`,
+  `ppo_policy_loss` with a `weight`), and only its 60 speeds may change. The
+  critic (inputs: `residual.speed_table_inputs`) learns from every car.
+- After each update the table is clipped to `SPEED_RANGE` and lowered wherever
+  neighbours break the speed-change rule (`train.keep_within_rule`), so a tuned
+  table keeps to the same rule it started from.
+- The reward is the simulator's: metres of progress per step, −10 for a wall.
+  Steering is pure pursuit with its own lookahead rule. The exploration
+  spread (0.3 m/s) is fixed: learned, PPO shrank it to 0.05 within one run.
+
+Because every stretch starts at a random point, the 2 m pieces line up
+differently each update and every point is tuned on its own over the run.
+
+```sh
+~/venvs/rl/bin/python training/speed_table.py                      # look at the starting table
+~/venvs/rl/bin/python training/train.py --method speed_table --smoke
+~/venvs/rl/bin/python training/train.py --method speed_table       # 40M steps
+~/venvs/rl/bin/python training/evaluate.py --speed-table training/runs/<run>/speed_table.npz
+cp training/runs/<run>/speed_table.npz race_ws/src/team_driver/models/   # then rebuild, as in step 4
+```
+
+The training log shows the stretch being tuned, the share of cars in it, how
+much its speeds moved, and the lap time the whole table implies. The driver
+logs `speed table tuned, from ...` when it uses the file, and refuses it if the
+racing line has changed since (different `wall_gap` or map).
+
 ## How the simulator matches the race, and where it does not
 
 Matches: car model (ST, RK4, 0.01 s), vehicle parameters, speed + steering
@@ -175,6 +227,8 @@ lap, and the driver occasionally skipping a scan.
   widen once a small residual laps cleanly, and continue from the previous
   weights with `--init`.
 - `COLLISION_PENALTY`, `RESIDUAL_COST` in `train.py`: the reward.
+- `WINDOW`, `NOISE_SEGMENT`, `SPEED_RANGE` in `train.py`, and `mu`, `a_brake`
+  in `DEFAULTS` (the starting table): the speed table.
 - `--steps`, `--envs`, `--lr`, `--gamma` on the command line.
 - If you change anything in `pure_pursuit.DEFAULTS`, retrain: the network
   learned to correct the old tuning. The driver warns when they differ.
