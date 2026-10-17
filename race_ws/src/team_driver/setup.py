@@ -14,7 +14,11 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
-        # Trained residual network weights, written by training/train.py.
+        # Trained models, written by training/train.py. Shipped:
+        #   lookahead.npz    the learned lookahead policy
+        #   speed_table.npz  the PPO-tuned speed table
+        # A new or changed .npz reaches share/ (where the driver looks)
+        # only after `colcon build`.
         (os.path.join('share', package_name, 'models'), glob('models/*.npz')),
     ],
     install_requires=['setuptools'],

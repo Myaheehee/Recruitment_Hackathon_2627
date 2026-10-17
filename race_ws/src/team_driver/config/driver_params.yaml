@@ -1,17 +1,38 @@
-# Your tuning lives here. Loaded with:
+# Optional parameter file for the driver. It is NOT used in the race.
+#
+# These values override pure_pursuit.DEFAULTS (team_driver/pure_pursuit.py)
+# only when the driver is started with this file. That happens with
+#   ros2 launch team_driver driver.launch.py      (loads it automatically)
+# or when it is passed by hand:
 #   ros2 run team_driver driver --ros-args --params-file \
 #       /hackathon/race_ws/src/team_driver/config/driver_params.yaml
-#
-# or in an evaluation run:
 #   ros2 launch roboracer_referee evaluate.launch.py team:=my_team \
 #       driver_params:=/hackathon/race_ws/src/team_driver/config/driver_params.yaml
+# The judges run `ros2 run team_driver driver`, which reads no file, so
+# pure_pursuit.DEFAULTS are the race settings, not the numbers below.
 #
-# Keeping the numbers out of the code means you can sweep them without
-# rebuilding, which is the fastest way to find lap time early on. Declare a
-# parameter in driver.py and it can be set here.
+# Several values here differ from DEFAULTS:
+#   v_max           6.0   (DEFAULTS 6.8)
+#   a_brake         6.11  (DEFAULTS 6.05)
+#   margin          0.5   (DEFAULTS 0.55)
+#   lookahead_gain  0.4   (DEFAULTS 0.25; the 2026-10-12 sweep found that
+#                          0.4 cuts the infield hairpin and hits it)
+# mu, ahead_angle, max_range and min_lookahead are the same as DEFAULTS.
 #
-# The two below are all the template needs, because the template does not
-# drive (see driver.py). Expect to replace them entirely.
+# With the shipped models most of these are unused. The lookahead policy
+# (models/lookahead.npz) picks the lookahead distance L, so lookahead_gain
+# and min_lookahead do nothing. The tuned speed table
+# (models/speed_table.npz) picks the speed, so v_max, margin, ahead_angle and
+# max_range do nothing, and mu and a_brake only matter if that table is
+# refused (they then build the untuned table).
+#
+# Loading this file also makes the driver warn "pure pursuit settings
+# changed since the policy was trained", listing v_max, a_brake, margin and
+# lookahead_gain (as well as table_scale and speed_lead, which every start
+# lists because the shipped models predate them).
+#
+# Any value set here must keep its type: write 6.0, not 6, for a setting
+# whose default has a decimal point.
 
 driver:
   ros__parameters:

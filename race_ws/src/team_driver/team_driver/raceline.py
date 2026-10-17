@@ -1,10 +1,11 @@
-"""The racing line, built from the map when the driver starts.
+"""Builds the minimum-curvature racing line and its speed table from the map at startup.
 
 The idea: start from the track's centreline and slide each point sideways
 so that the lap bends as little as possible, while keeping the car clear of
 the walls. A gently bending line can be driven faster (see the cornering
 limit in pure_pursuit.py), and "wide in, clip the inside, wide out" is
-exactly what a bend-minimising line looks like.
+exactly what a bend-minimising line looks like. Curvature = 1 / turn
+radius [1/m]: 0 on a straight, larger in a tighter bend.
 
     build_raceline()        the whole recipe, in four steps
       left_directions()     step 1: which way is sideways at each point
@@ -39,13 +40,32 @@ SPACING = 0.2            # [m] distance between points of the finished line
 
 
 def build_raceline(centre, clearance, margin, iters, log=print):
-    """Return the racing line as an (N, 2) array of x, y points.
+    """Build the racing line from the centreline, in four steps.
 
-    centre     (N, 2) centreline points, in driving order
-    clearance  the function from load_clearance_map()
-    margin     [m] closest the middle of the car may come to a wall
-    iters      how many nudges in step 3
-    log        how to report: the driver passes its ROS logger
+    Slides each centreline point sideways to bend the lap as little as
+    possible (steps 1-3), then spaces the points SPACING apart (step 4).
+    The finished line is checked against the map; if it comes too close
+    to a wall, the centreline is returned instead.
+
+    Parameters
+    ----------
+    centre : (N, 2) array
+        Centreline points [m], in driving order.
+    clearance : callable
+        The function from load_clearance_map(): (..., 2) points [m] ->
+        distance to the nearest wall [m].
+    margin : float
+        Closest the middle of the car may come to a wall [m].
+    iters : int
+        How many nudges in step 3.
+    log : callable
+        How to report: the driver passes its ROS logger.
+
+    Returns
+    -------
+    (M, 2) array
+        The racing line, x, y points [m] about SPACING (0.2 m) apart, in
+        driving order. (Or `centre` itself, if the check fails.)
     """
     left = left_directions(centre)
     max_left, max_right = slide_limits(centre, left, clearance, margin)
@@ -65,12 +85,24 @@ def build_raceline(centre, clearance, margin, iters, log=print):
 
 
 def left_directions(points):
-    """Step 1. For each point of a closed loop, a length-1 vector pointing
-    to the left of the direction of travel.
+    """Step 1. A unit vector pointing left of the direction of travel, at every point.
+
+    For each point of a closed loop, a length-1 vector pointing to the left
+    of the direction of travel.
 
     np.roll shifts an array round by one place, so np.roll(points, -1)[i] is
     the next point and np.roll(points, 1)[i] the previous one. It wraps
     round at the ends, which is right because the lap is a loop.
+
+    Parameters
+    ----------
+    points : (N, 2) array
+        A closed loop of points [m], in driving order.
+
+    Returns
+    -------
+    (N, 2) array
+        Length-1 left-pointing vectors, one per point.
     """
     forward = np.roll(points, -1, axis=0) - np.roll(points, 1, axis=0)
     forward /= np.linalg.norm(forward, axis=1, keepdims=True)
@@ -78,11 +110,31 @@ def left_directions(points):
 
 
 def slide_limits(centre, left, clearance, margin):
-    """Step 2. How far [m] each point may slide left, and how far right,
-    before the car would come closer than `margin` to a wall.
+    """Step 2. How far each point may slide left, and how far right, and stay clear of the walls.
+
+    How far [m] each point may slide left, and how far right, before the car
+    would come closer than `margin` to a wall.
 
     For every point, test positions sideways from it, SAMPLE_STEP apart, and
     keep going until one is too close to a wall.
+
+    Parameters
+    ----------
+    centre : (N, 2) array
+        Centreline points [m], in driving order.
+    left : (N, 2) array
+        Length-1 left-pointing vectors from left_directions().
+    clearance : callable
+        The function from load_clearance_map().
+    margin : float
+        Closest the middle of the car may come to a wall [m].
+
+    Returns
+    -------
+    max_left : (N,) array
+        How far each point may slide left [m], 0..MAX_SLIDE.
+    max_right : (N,) array
+        How far each point may slide right [m], 0..MAX_SLIDE.
     """
     steps = int(MAX_SLIDE / SAMPLE_STEP)
     offsets = np.arange(-steps, steps + 1) * SAMPLE_STEP           # -3.0 ... +3.0 m, 0 in the middle
@@ -93,10 +145,23 @@ def slide_limits(centre, left, clearance, margin):
     going_right = fits[:, steps::-1]          # offsets 0, -0.025, -0.05, ...
 
     def furthest(ok):
-        # cumprod turns each row into 1s up to the first failure and 0s
-        # after it, so the sum is how many positions in a row fit. The first
-        # of those is the centreline itself, hence the - 1. A point that is
-        # already too close to a wall gets 0 and stays where it is.
+        """How far each point can slide before the first position that does not fit.
+
+        cumprod turns each row into 1s up to the first failure and 0s
+        after it, so the sum is how many positions in a row fit. The first
+        of those is the centreline itself, hence the - 1. A point that is
+        already too close to a wall gets 0 and stays where it is.
+
+        Parameters
+        ----------
+        ok : (N, K) bool array
+            ok[i, j]: point i slid j * SAMPLE_STEP in one direction fits.
+
+        Returns
+        -------
+        (N,) array
+            The furthest slide that still fits, for each point [m].
+        """
         in_a_row = np.cumprod(ok, axis=1).sum(axis=1)
         return np.maximum(in_a_row - 1, 0) * SAMPLE_STEP
 
@@ -104,12 +169,30 @@ def slide_limits(centre, left, clearance, margin):
 
 
 def minimise_bending(centre, left, max_left, max_right, iters):
-    """Step 3. How far each point slides to the left (negative = right) so
-    that the line bends as little as possible.
+    """Step 3. Slide each point sideways so that the line bends as little as possible.
+
+    Works out how far each point slides to the left (negative = right).
 
     The loop repeats one small move: work out which way each point should
     slide to reduce the total bending, slide it a little that way, and clamp
-    it to the limits from step 2.
+    it to the limits from step 2. (This is gradient descent: repeatedly
+    taking a small step in the direction that makes a quantity shrink.)
+
+    Parameters
+    ----------
+    centre : (N, 2) array
+        Centreline points [m], in driving order.
+    left : (N, 2) array
+        Length-1 left-pointing vectors from left_directions().
+    max_left, max_right : (N,) array
+        Slide limits [m] from slide_limits().
+    iters : int
+        How many small moves to make.
+
+    Returns
+    -------
+    (N,) array
+        Sideways slide of each point [m], positive = left.
     """
     shift = np.zeros(len(centre))
     for _ in range(iters):
@@ -131,7 +214,22 @@ def minimise_bending(centre, left, max_left, max_right, iters):
 
 def resample(points, spacing):
     """Step 4. The same closed loop, redrawn as points `spacing` apart.
-    (Sliding bunched the points up on the inside of bends.)"""
+
+    (Sliding bunched the points up on the inside of bends.)
+
+    Parameters
+    ----------
+    points : (N, 2) array
+        A closed loop of points [m], in driving order.
+    spacing : float
+        Wanted distance between points [m].
+
+    Returns
+    -------
+    (M, 2) array
+        The loop as evenly spaced points [m], M = loop length / spacing
+        (rounded).
+    """
     closed = np.vstack([points, points[:1]])                   # repeat point 0 to close the loop
     step_lengths = np.linalg.norm(np.diff(closed, axis=0), axis=1)
     distance = np.concatenate([[0.0], np.cumsum(step_lengths)])  # distance along the loop to each point
@@ -143,11 +241,7 @@ def resample(points, spacing):
 
 
 def speed_table(path, curvature, params):
-    """The fastest speed [m/s] at each point of the closed `path`, one per point.
-
-    curvature  how sharply the line bends at each point [1/m]
-               (residual.path_geometry works it out)
-    params     uses mu and a_brake from the tuning table
+    """The fastest speed at each point of the closed `path`, one per point.
 
     Two rules, and no top speed: on a straight only rule 2 limits the speed.
     1. Corners. At each point on its own: no faster than the cornering limit
@@ -158,13 +252,30 @@ def speed_table(path, curvature, params):
        is v_next^2 <= v^2 + 2 * a_brake * d: the distance needed to change
        speed at a_brake.
     Rule 2 is limit_speed_changes(), below.
+
+    Parameters
+    ----------
+    path : (N, 2) array
+        The racing line [m], a closed loop in driving order.
+    curvature : (N,) array
+        How sharply the line bends at each point [1/m]
+        (policies.path_geometry works it out).
+    params : dict
+        The tuning table; uses mu (tyre grip, no unit) and a_brake [m/s^2].
+
+    Returns
+    -------
+    (N,) array
+        Target speed at each point [m/s].
     """
     corner = np.sqrt(params['mu'] * G / np.maximum(np.abs(curvature), MIN_CURVATURE))
     return limit_speed_changes(path, corner, params['a_brake'])
 
 
 def limit_speed_changes(path, speeds, a_brake):
-    """Lower the speeds of the closed `path` where needed, so that between
+    """Lower speeds where needed so that neighbouring points obey the braking rule.
+
+    Lower the speeds of the closed `path` where needed, so that between
     any two neighbouring points the speed changes by at most
     2 * a_brake * d / (v + v_next). Speeds are only ever lowered.
 
@@ -172,6 +283,21 @@ def limit_speed_changes(path, speeds, a_brake):
     having sped up from the point before?) and then backwards (how fast can
     it be here and still slow down in time for the point after?). Training
     uses it too, to keep a tuned speed table within the rule.
+
+    Parameters
+    ----------
+    path : (N, 2) array
+        The racing line [m], a closed loop in driving order.
+    speeds : (N,) array
+        Starting speed at each point [m/s].
+    a_brake : float
+        Largest speed-up or slow-down allowed [m/s^2].
+
+    Returns
+    -------
+    (N,) array
+        The speeds [m/s], lowered where needed. (A new array; `speeds` is
+        not changed.)
     """
     gap = np.linalg.norm(np.roll(path, -1, axis=0) - path, axis=1)   # gap[i]: point i to point i+1
     v = np.array(speeds, dtype=float)
@@ -190,19 +316,48 @@ def limit_speed_changes(path, speeds, a_brake):
 
 
 def lap_time(path, speeds):
-    """Seconds for one lap of the closed `path` at these speeds: each gap
-    between points takes its length divided by the average of its two ends."""
+    """Seconds for one lap of the closed `path` at these speeds.
+
+    Each gap between points takes its length divided by the average of
+    the speeds at its two ends.
+
+    Parameters
+    ----------
+    path : (N, 2) array
+        The racing line [m], a closed loop in driving order.
+    speeds : (N,) array
+        Speed at each point [m/s].
+
+    Returns
+    -------
+    float
+        Lap time [s], if the car drove these speeds exactly.
+    """
     gap = np.linalg.norm(np.roll(path, -1, axis=0) - path, axis=1)
     return float(np.sum(gap / (0.5 * (speeds + np.roll(speeds, -1)))))
 
 
 def load_clearance_map(map_yaml):
-    """Read the map and return a function clearance(points) giving, for any
-    (x, y) points, the distance in metres to the nearest wall.
+    """Read the map and return a function that gives the distance to the nearest wall.
+
+    The returned function clearance(points) gives, for any (x, y) points,
+    the distance in metres to the nearest wall.
 
     Rows of cones are sealed into solid walls first: the gaps between cones
     are wide enough for the car, but driving through them is against the
     rules (rule 11).
+
+    Parameters
+    ----------
+    map_yaml : str
+        Path to the map's .yaml file (it names the image, the resolution
+        in metres per pixel, and the origin).
+
+    Returns
+    -------
+    callable
+        clearance(points): (..., 2) array of x, y [m] -> (...) array of
+        distances to the nearest wall [m]. Off the map counts as 0.
     """
     with open(map_yaml) as f:
         meta = yaml.safe_load(f)
@@ -227,6 +382,19 @@ def load_clearance_map(map_yaml):
     distance_to_wall = ndimage.distance_transform_edt(~wall) * resolution
 
     def clearance(points):
+        """Distance from each point to the nearest wall.
+
+        Parameters
+        ----------
+        points : (..., 2) array
+            x, y positions [m] in the map frame, any leading shape.
+
+        Returns
+        -------
+        (...) array
+            Distance to the nearest wall [m], blended from the 4 nearest
+            pixels. Points off the map get 0.
+        """
         # Map (x, y) -> pixel (row, column). Image rows count down from the
         # top while y counts up, hence the flip; the 0.5 is because pixel
         # centres are half a pixel in from their corners.

@@ -8,7 +8,7 @@
   -->
   <name>team_driver</name>
   <version>0.1.0</version>
-  <description>TODO: your team name and a one-line description of your approach.</description>
+  <description>NTU hackathon driver: runtime minimum-curvature racing line, pure pursuit with a learned lookahead, and a PPO-tuned speed table.</description>
   <maintainer email="you@e.ntu.edu.sg">Your Team</maintainer>
   <license>MIT</license>
 

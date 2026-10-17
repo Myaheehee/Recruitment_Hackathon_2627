@@ -1,24 +1,30 @@
-"""Check that training and racing compute the same thing.
+"""Check that training (jax.numpy) and racing (numpy) compute the same thing; run `~/venvs/rl/bin/python training/test_parity.py`.
 
-    python training/test_parity.py
+    python training/test_parity.py      # "python" = ~/venvs/rl/bin/python
 
 1. pure_pursuit() agrees with the original plan() from commit 0c2a770
    (before the controller moved out of driver.py).
 2. numpy (the driver) and jax.numpy (training) give the same pure pursuit
-   command, the same network inputs and the same network output.
-3. A weights file written by train.py reads back correctly with the
-   driver's loader.
-4. The dynamic-lookahead policy: numpy and jax.numpy agree on its 5 inputs,
+   command.
+3. The dynamic-lookahead policy: numpy and jax.numpy agree on its 5 inputs,
    on L, on pure pursuit aiming L ahead, and on the loss; JAX's gradient of
    the loss matches a numerical one; a saved policy reads back correctly.
-5. The speed table keeps to its rules: neighbouring speeds differ by at most
+4. The speed table keeps to its rules: neighbouring speeds differ by at most
    2 * a_brake * d / (v + v_next), and no point beats its cornering limit.
+   pure_pursuit() reads the table off at the nearest point, and numpy and
+   jax agree on that speed with and without speed_lead (which adds a share
+   of how much the table changes over the next metre).
    Its training loss agrees in numpy and jax, its gradient matches a numerical
    one and lands only on the points driven past inside the window, and a
    tuned table reads back correctly.
 
-If any of these fail, a network trained here would be racing a different
-controller from the one it learned to correct.
+Check 1 uses 1000 random cases and must agree to 1e-9 (both are numpy).
+The numpy-vs-jax checks use 300 or 100 random cases and allow 1e-3,
+because JAX works in 32-bit floats and numpy in 64-bit (in practice the
+differences are about 1e-6).
+
+If any of these fail, a policy trained here would be racing a different
+controller from the one it was trained with.
 """
 
 import math
@@ -35,16 +41,27 @@ import numpy as np
 import sim
 from team_driver.pure_pursuit import DEFAULTS, G, pure_pursuit
 from team_driver.raceline import speed_table
-from team_driver.residual import (
-    actor, features, load_lookahead, load_speed_table, load_weights, lookahead, lookahead_inputs,
-    lookahead_loss, path_geometry, speed_table_loss)
+from team_driver.policies import (
+    load_lookahead, load_speed_table, lookahead, lookahead_inputs, lookahead_loss,
+    path_geometry, speed_table_loss)
 import train
 
 ORIGINAL = '0c2a770'      # last commit with plan() written out inside driver.py
 
 
 def original_plan():
-    """plan() exactly as it was in driver.py, loaded from git."""
+    """Load plan() exactly as it was in driver.py, from git.
+
+    Reads driver.py as it was at commit ORIGINAL with `git show`, cuts out
+    the plan() method and runs its source to get the function back.
+
+    Returns
+    -------
+    callable
+        plan(self, ranges, angles), whose first two outputs are steering
+        [rad] and speed [m/s]; `self` can be any object with the
+        attributes plan() reads.
+    """
     source = subprocess.run(
         ['git', '-C', str(sim.REPO), 'show',
          f'{ORIGINAL}:race_ws/src/team_driver/team_driver/driver.py'],
@@ -57,16 +74,40 @@ def original_plan():
 
 
 def random_situation(rng, path, angles):
+    """Make up a random car state near the racing line, to test with.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator
+        Random number generator (seeded, so every run tests the same cases).
+    path : numpy.ndarray, shape (points, 2)
+        Racing-line points [m].
+    angles : numpy.ndarray, shape (beams,)
+        LiDAR beam angles [rad]; only its length is used.
+
+    Returns
+    -------
+    dict
+        car: position (x, y) [m] near a random path point; yaw [rad];
+        speed [m/s]; ranges: one random LiDAR distance per beam [m].
+    """
     i = rng.integers(len(path))
     return dict(car=path[i] + rng.normal(0.0, 0.3, 2), yaw=rng.uniform(-math.pi, math.pi),
-                speed=rng.uniform(0.0, 8.0), yaw_rate=rng.normal(0.0, 2.0),
-                last_steer=rng.uniform(-0.4, 0.4), ranges=rng.uniform(0.0, 8.0, len(angles)))
+                speed=rng.uniform(0.0, 8.0), ranges=rng.uniform(0.0, 8.0, len(angles)))
 
 
 def main():
+    """Run checks 1-4 from the module docstring, printing each result.
+
+    Each check prints the largest difference it found and then asserts it
+    is small, so the first failing check stops the script with an
+    AssertionError. The random cases come from a generator seeded with 0,
+    so every run tests the same cases. Prints only; the saved files of
+    checks 3-5 go to a temporary folder that is deleted afterwards.
+    """
     rng = np.random.default_rng(0)
     path = sim.racing_line()
-    heading, curvature = path_geometry(path)
+    _, curvature = path_geometry(path)
     angles = np.deg2rad(-135.0) + np.arange(819) * np.deg2rad(270.0) / 818
 
     # 1. Moved code == original code.
@@ -84,49 +125,24 @@ def main():
     print(f'1. original plan() vs pure_pursuit(): largest difference {worst:.1e}')
     assert worst < 1e-9
 
-    # 2. numpy == jax, for pure pursuit, features and the network.
-    params = train.init_params(jax.random.key(1), 'residual', 128)
-    # Make the network's output big enough that a mismatch would show.
-    params['actor']['W2'] = params['actor']['W2'] * 100.0
-    weights_np = {k: np.asarray(v, dtype=np.float64) for k, v in params['actor'].items()}
-    j = {k: jnp.asarray(v) for k, v in dict(path=path, heading=heading, curvature=curvature,
+    # 2. numpy == jax, for pure pursuit.
+    j = {k: jnp.asarray(v) for k, v in dict(path=path, curvature=curvature,
                                              angles=angles).items()}
-    worst = {'command': 0.0, 'features': 0.0, 'network': 0.0}
+    worst = 0.0
     for _ in range(300):
         s = random_situation(rng, path, angles)
-        steer, speed, nearest, ahead = pure_pursuit(
+        steer, speed, _, _ = pure_pursuit(
             path, s['car'], s['yaw'], s['speed'], s['ranges'], angles, DEFAULTS)
-        x = features(path, heading, curvature, s['car'], s['yaw'], s['speed'], s['yaw_rate'],
-                     s['last_steer'], steer, speed, nearest, ahead, DEFAULTS)
-        out = actor(weights_np, x)
-
         js = {k: jnp.asarray(v) for k, v in s.items()}
-        jsteer, jspeed, jnearest, jahead = pure_pursuit(
+        jsteer, jspeed, _, _ = pure_pursuit(
             j['path'], js['car'], js['yaw'], js['speed'], js['ranges'], j['angles'],
             DEFAULTS, xp=jnp)
-        jx = features(j['path'], j['heading'], j['curvature'], js['car'], js['yaw'], js['speed'],
-                      js['yaw_rate'], js['last_steer'], jsteer, jspeed, jnearest, jahead,
-                      DEFAULTS, xp=jnp)
-        jout = actor(params['actor'], jx, xp=jnp)
+        worst = max(worst, abs(steer - float(jsteer)), abs(speed - float(jspeed)))
+    print(f'2. numpy vs jax, pure pursuit command: largest difference {worst:.1e}')
+    # JAX computes in 32-bit floats, numpy in 64-bit: expect ~1e-6, not 0.
+    assert worst < 1e-3, worst
 
-        worst['command'] = max(worst['command'], abs(steer - float(jsteer)), abs(speed - float(jspeed)))
-        worst['features'] = max(worst['features'], float(np.max(np.abs(x - np.asarray(jx)))))
-        worst['network'] = max(worst['network'], float(np.max(np.abs(out - np.asarray(jout)))))
-    print('2. numpy vs jax, largest differences: '
-          + ', '.join(f'{k} {v:.1e}' for k, v in worst.items()))
-    # JAX computes in 32-bit floats, numpy in 64-bit: expect ~1e-5, not 0.
-    assert all(v < 1e-3 for v in worst.values()), worst
-
-    # 3. A saved file loads back with the driver's loader.
-    with tempfile.TemporaryDirectory() as tmp:
-        file = f'{tmp}/residual.npz'
-        train.save(file, params, Namespace(method='residual'))
-        loaded, limits, trained_with = load_weights(file)
-    assert all(np.array_equal(loaded[k], np.asarray(params['actor'][k])) for k in loaded)
-    assert trained_with == DEFAULTS, trained_with
-    print(f'3. save -> load round trip OK, limits {limits}')
-
-    # 4. Dynamic lookahead.
+    # 3. Dynamic lookahead.
     policy = {'w': np.array([0.35, -0.4, -0.3, -0.2, 0.5]), 'b': 0.3}
     jpolicy = {'w': jnp.asarray(policy['w']), 'b': jnp.asarray(policy['b'])}
     worst = {'inputs': 0.0, 'L': 0.0, 'command': 0.0}
@@ -173,7 +189,7 @@ def main():
         numerical[i] = (up - down) / 2e-6
     worst['loss'] = abs(numpy_loss - float(jax_loss))
     worst['gradient'] = float(np.max(np.abs(np.asarray(gradient) - numerical)))
-    print('4. dynamic lookahead, numpy vs jax: '
+    print('3. dynamic lookahead, numpy vs jax: '
           + ', '.join(f'{k} {v:.1e}' for k, v in worst.items()))
     assert all(v < 1e-3 for v in worst.values()), worst
 
@@ -186,28 +202,33 @@ def main():
     assert trained_with == DEFAULTS
     print(f'   save -> load round trip OK, starting {train.equation(lparams["actor"])}')
 
-    # 5. Speed table. np.roll(x, -1)[i] is the next point, wrapping round the lap.
+    # 4. Speed table. np.roll(x, -1)[i] is the next point, wrapping round the lap.
     speeds = speed_table(path, curvature, DEFAULTS)
     after = np.roll(speeds, -1)
     gap = np.linalg.norm(np.roll(path, -1, axis=0) - path, axis=1)
     allowed = 2.0 * DEFAULTS['a_brake'] * gap / (speeds + after)
     corner = np.sqrt(DEFAULTS['mu'] * G / np.abs(curvature))
-    print(f'5. speed table: largest step {np.max(np.abs(after - speeds) - allowed):+.1e} m/s '
+    print(f'4. speed table: largest step {np.max(np.abs(after - speeds) - allowed):+.1e} m/s '
           f'beyond the limit (want <= 0), {np.sum(speeds > corner + 1e-9)} points too fast for '
           f'their corner, top {speeds.max():.2f} m/s')
     assert np.all(np.abs(after - speeds) <= allowed + 1e-9)
     assert np.all(speeds <= corner + 1e-9)
-    # pure_pursuit() reads it off at the nearest point, the same in numpy and jax.
+    # pure_pursuit() reads it off at the nearest point (exactly, with no lead),
+    # the same in numpy and jax, with and without the lead (speed_lead).
+    no_lead, with_lead = dict(DEFAULTS, speed_lead=0.0), dict(DEFAULTS, speed_lead=1.5)
     for _ in range(100):
         s = random_situation(rng, path, angles)
         command = pure_pursuit(path, s['car'], s['yaw'], s['speed'], s['ranges'], angles,
-                               DEFAULTS, speed_table=speeds)
-        jcommand = pure_pursuit(j['path'], jnp.asarray(s['car']), s['yaw'], s['speed'],
-                                jnp.asarray(s['ranges']), j['angles'], DEFAULTS, xp=jnp,
-                                speed_table=jnp.asarray(speeds))
+                               no_lead, speed_table=speeds)
         assert command[1] == speeds[command[2]]
-        assert abs(command[1] - float(jcommand[1])) < 1e-3 and command[2] == int(jcommand[2])
-    print('   pure_pursuit() with the speed table: numpy and jax agree')
+        for p in (no_lead, with_lead):
+            command = pure_pursuit(path, s['car'], s['yaw'], s['speed'], s['ranges'], angles,
+                                   p, speed_table=speeds)
+            jcommand = pure_pursuit(j['path'], jnp.asarray(s['car']), s['yaw'], s['speed'],
+                                    jnp.asarray(s['ranges']), j['angles'], p, xp=jnp,
+                                    speed_table=jnp.asarray(speeds))
+            assert abs(command[1] - float(jcommand[1])) < 1e-3 and command[2] == int(jcommand[2])
+    print('   pure_pursuit() with the speed table and its lead: numpy and jax agree')
 
     # Its training loss. Samples at random points; only some are inside the window.
     point = rng.integers(len(path), size=256)
