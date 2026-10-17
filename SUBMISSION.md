@@ -1,4 +1,4 @@
-# Team TODO-team-name
+# Team DeepSpeed Team 2
 
 > **TODO before submitting:** fill in every `TODO` (team name, members, results,
 > machine). The results must come from your own `./scripts/evaluate.sh` runs:
@@ -8,7 +8,8 @@
 ## Members
 | Name | Matric number | Email |
 | --- | --- | --- |
-| TODO | TODO | TODO |
+| Hridyan Deshpande | --- | --- |
+| Leonard | M2622241F | Lcheng016@e.ntu.edu.sg |
 
 ## Approach
 
@@ -79,7 +80,7 @@ The runs committed in `results/submitted/`, summarised.
 
 | Best lap | 10-lap total | Collisions | Runs attempted |
 | --- | --- | --- | --- |
-| TODO | TODO | TODO | TODO |
+| 13.790 | 137.900 | 1 | 5 |
 
 ### The machine that produced them
 | CPU | GPU | RAM | OS | Typical real-time factor |
