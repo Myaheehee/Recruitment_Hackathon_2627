@@ -1,7 +1,15 @@
 # Our F1TENTH driver: a two-page overview
 
-> For how to run the driver and what every setting does, see the
-> [driver reference](driver_reference.md).
+## Guide to the documentation
+
+| Read | What it is | When to read it |
+| --- | --- | --- |
+| **This page** | The whole project in two pages | First |
+| [interview_prep.md](interview_prep.md) | Every likely interview question, each answered from one line down to the maths | Before the interview |
+| [driver_reference.md](driver_reference.md) | How to run the driver, every setting, and how each code file works | When working on or explaining the driver |
+| [training/README.md](../training/README.md) | Reinforcement learning from scratch, both training methods, every flag and run | When training, or explaining the RL |
+| [SUBMISSION.md](../SUBMISSION.md) | What we hand in to the judges | Before submitting |
+| [unused/README.md](../unused/README.md) | Code we kept but don't use (the residual network) | Only if asked about it |
 
 Our car laps the `icra26` track in about **13.7 s** on the official referee,
 with no wall contacts. It follows a **racing line built from the map**, steers

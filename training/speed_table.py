@@ -1,27 +1,10 @@
-"""Compute, print and plot the physics-based speed table; run `~/venvs/rl/bin/python training/speed_table.py`.
+"""Print and draw the untuned physics speed table, the starting point that PPO tunes.
 
-    python training/speed_table.py                      # with pure_pursuit.DEFAULTS
+    python training/speed_table.py                       # with pure_pursuit.DEFAULTS
     python training/speed_table.py --mu 0.8 --a-brake 5  # try other values
 
-("python" here means ~/venvs/rl/bin/python.)
-
-The table (raceline.speed_table) gives one target speed per racing-line
-point: as fast as the corner allows (mu), with neighbouring points never
-further apart in speed than braking at a_brake allows. There is no top speed.
-
-The driver does use a speed table, by default (use_speed_table=True in
-pure_pursuit.DEFAULTS). It races a PPO-tuned table,
-race_ws/src/team_driver/models/speed_table.npz, made by
-`train.py --method speed_table`, which starts from the table worked out
-here. (If the tuned table's stored racing line does not match the one the
-driver builds at startup, the driver falls back to the table worked out
-here.) This script only works out and draws that untuned starting table;
-it writes no .npz and changes nothing the driver uses. (DEFAULTS['v_max']
-only matters when use_speed_table is False.)
-
-Prints a summary and every 10th point, and writes
-    training/speed_table.csv   every point: index, distance along the lap, x, y, curvature, speed
-    training/speed_table.png   the line on the map, blue = slow, red = fast
+"python" = ~/venvs/rl/bin/python. Writes training/speed_table.csv and training/speed_table.png
+(blue = slow, red = fast). Changes nothing the driver uses: it races models/speed_table.npz.
 """
 
 import argparse
@@ -35,18 +18,14 @@ import sim
 from team_driver.pure_pursuit import DEFAULTS
 from team_driver.raceline import lap_time, speed_table
 from team_driver.policies import path_geometry
+from team_driver.units import Array
 
 HERE = Path(__file__).resolve().parent
 SCALE = 3          # the png is drawn this many times larger than the map
 
 
-def main():
-    """Build the table from the command-line mu and a_brake, print it and save it.
-
-    Reads --mu and --a-brake (defaults from pure_pursuit.DEFAULTS), builds the
-    racing line and its table, prints a summary and every 10th point, and
-    writes training/speed_table.csv and training/speed_table.png.
-    """
+def main() -> None:
+    """Build the table from --mu and --a-brake, print it (every 10th point), save csv and png."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--mu', type=float, default=DEFAULTS['mu'], help='cornering grip')
@@ -81,18 +60,8 @@ def main():
     print(f'\nwrote {HERE / "speed_table.csv"} and {HERE / "speed_table.png"}')
 
 
-def draw(path, speeds, file):
-    """Draw the racing line on the map, each piece coloured by its speed.
-
-    Parameters
-    ----------
-    path : numpy.ndarray, shape (points, 2)
-        Racing-line points (x, y) in map coordinates [m].
-    speeds : numpy.ndarray, shape (points,)
-        Target speed at each point [m/s].
-    file : pathlib.Path or str
-        Where to save the PNG (blue = slowest, red = fastest).
-    """
+def draw(path: Array, speeds: Array, file: Path | str) -> None:
+    """Save a PNG of the racing line on the map, coloured by speed (blue = slow, red = fast)."""
     meta = yaml.safe_load(open(sim.MAP_YAML))
     image = Image.open(sim.MAP_YAML.parent / meta['image']).convert('RGB')
     height, resolution = image.height, meta['resolution']
@@ -100,8 +69,8 @@ def draw(path, speeds, file):
     image = image.resize((image.width * SCALE, height * SCALE), Image.NEAREST)
     pen = ImageDraw.Draw(image)
 
-    def pixel(point):                       # map (x, y) [m] -> image (column, row)
-        """Convert a map point (x, y) [m] to a pixel (column, row) in the scaled image."""
+    def pixel(point: Array) -> tuple[float, float]:
+        """Map point (x, y) [m] -> pixel (column, row) in the scaled image."""
         return ((point[0] - origin_x) / resolution * SCALE,
                 (height - (point[1] - origin_y) / resolution) * SCALE)
 

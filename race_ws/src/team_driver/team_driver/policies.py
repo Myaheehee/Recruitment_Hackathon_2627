@@ -1,59 +1,23 @@
-"""The learned parts of the driver: a lookahead policy and a speed table.
+"""The driver's two learned parts: a lookahead policy and a PPO-tuned speed table.
 
-Two ways for reinforcement learning (RL: learning by trial and error,
-from a reward) to help pure pursuit:
-
-1. Dynamic lookahead (first section), after Elgouhary & El-Wakeel 2026,
-   "Dynamic Lookahead Distance via Reinforcement Learning-Based Pure
-   Pursuit for Autonomous Racing" (arXiv 2603.28625): the policy chooses
-   only pure pursuit's lookahead distance L, from 5 inputs. Here the policy
-   is linear, 5 weights and a bias, so what it learned can be read off.
-   Shipped as models/lookahead.npz.
-
-2. Speed table (second section): the policy IS the speed table, one speed
-   per racing-line point, starting from raceline.speed_table and tuned by
-   PPO (Proximal Policy Optimisation, the RL method used here; see
-   ppo_policy_loss). Shipped as models/speed_table.npz.
-
-Both learn by PPO, whose loss (gaussian_log_prob, ppo_policy_loss) sits in
-the first section and is shared.
-
-Like pure_pursuit.py, every function takes `xp` (numpy in the driver,
-jax.numpy in training), so training and racing compute the policies'
-inputs and outputs with literally the same code.
-
-Shapes: the functions work on ONE car. Training runs thousands of cars at
-once with jax.vmap, which applies a one-car function to every car.
+Race driver uses: path_geometry, lookahead_inputs, lookahead, load_lookahead, load_speed_table.
+Training only: speed_table_inputs and the PPO maths (gaussian_log_prob, ppo_policy_loss,
+lookahead_loss, speed_table_loss). Every function takes `xp` (numpy in the driver, jax.numpy
+in training) and works on ONE car; training runs thousands at once with jax.vmap.
 """
 
 import numpy as np
 
 from team_driver.pure_pursuit import DEFAULTS
+from team_driver.units import Array, Metres, MetresPerSecond
 
 
-# ======================================================================
-# The racing line's geometry, which both policies read
-# ======================================================================
+# ---- Racing-line geometry, read by both policies ----
 
+def path_geometry(path: Array) -> tuple[Array, Array]:
+    """Heading [rad] and curvature [1/m] at every point of a closed path.
 
-def path_geometry(path):
-    """Heading and curvature at every point of a closed path.
-
-    Curvature = 1 / turn radius [1/m]: 0 on a straight, larger in a tighter
-    bend, positive turning left. Numpy only: computed once at startup, not
-    every step.
-
-    Parameters
-    ----------
-    path : (N, 2) array
-        A closed loop of points [m], in driving order.
-
-    Returns
-    -------
-    heading : (N,) array
-        Direction of travel at each point [rad].
-    curvature : (N,) array
-        Curvature at each point [1/m].
+    Curvature is positive turning left. Numpy only: computed once at startup.
     """
     ahead = np.roll(path, -1, axis=0)
     behind = np.roll(path, 1, axis=0)
@@ -66,155 +30,47 @@ def path_geometry(path):
     return heading, curvature
 
 
-# ======================================================================
-# 1. Dynamic lookahead: L = b + w . s
-# ======================================================================
-#
-# The 5 inputs s, as in the paper (eq. 11):
-#     v      speed [m/s]
-#     |k0|   how sharply the racing line bends at the nearest point [1/m]
-#     |k1|   ... HORIZONS[1] points (1 m) further on
-#     |k2|   ... HORIZONS[2] points (3 m) further on
-#     dk     |k1| - |k0|: is the bend ahead getting tighter (+) or opening (-)?
-# The paper does not say how far ahead its horizons are; 1 m and 3 m are ours.
+# ---- 1. Lookahead policy: L = b + w . s (after arXiv 2603.28625) ----
+
+# s (paper eq. 11): speed [m/s], |curvature| [1/m] at the HORIZONS, and dk = |k1| - |k0|.
 LOOKAHEAD_INPUTS = ('v', '|k0|', '|k1|', '|k2|', 'dk')
-HORIZONS = (0, 5, 15)                  # path points ahead (0.2 m apart)
+HORIZONS = (0, 5, 15)                  # path points ahead: 0, 1 m, 3 m (ours; paper gives none)
 LOOKAHEAD_RANGE = (0.35, 4.0)          # [m] the paper's limits on L (eq. 12)
 
-# Where training starts: L = lookahead_gain * v, close to the hand-made rule
-# in pure_pursuit.py (max(min_lookahead, lookahead_gain * v)). So training
-# begins from today's driver.
+# Training starts at L = lookahead_gain * v, i.e. from pure_pursuit.py's hand-made rule.
 START_WEIGHTS = (DEFAULTS['lookahead_gain'], 0.0, 0.0, 0.0, 0.0)
 START_BIAS = 0.0
 
 
-def lookahead_inputs(curvature, nearest, speed, xp=np):
-    """The 5 lookahead-policy inputs s for one car.
-
-    `curvature` comes from path_geometry(), `nearest` from the closest
-    path point to the car.
-
-    Parameters
-    ----------
-    curvature : (N,) array
-        Curvature of the racing line at each point [1/m].
-    nearest : int
-        Index of the path point closest to the car.
-    speed : float
-        The car's speed [m/s].
-    xp : module
-        numpy or jax.numpy module; the same code runs in the ROS driver
-        (numpy) and in training (JAX).
-
-    Returns
-    -------
-    (5,) array
-        s = (v [m/s], |k0|, |k1|, |k2| [1/m], dk [1/m]), as LOOKAHEAD_INPUTS.
-    """
+def lookahead_inputs(curvature: Array, nearest: int, speed: MetresPerSecond, xp=np) -> Array:
+    """The 5 lookahead-policy inputs s for one car, in LOOKAHEAD_INPUTS order."""
     n = curvature.shape[0]
     k0, k1, k2 = xp.abs(curvature[(nearest + xp.asarray(HORIZONS)) % n])
     return xp.stack([speed, k0, k1, k2, k1 - k0])
 
 
-def lookahead(policy, s, xp=np):
-    """The lookahead policy: L = b + w_v*v + w_0*|k0| + w_1*|k1| + w_2*|k2| + w_d*dk.
+def lookahead(policy: dict, s: Array, xp=np) -> Metres:
+    """The lookahead policy: L = b + w . s, with policy = {'w': (5,) weights, 'b': bias}.
 
-    Works for one car (s has shape (5,)) or many (s has shape (cars, 5)).
-    The caller clips the result to LOOKAHEAD_RANGE before using it.
-
-    Parameters
-    ----------
-    policy : dict
-        {'w': (5,) array of weights, 'b': float bias}.
-    s : (5,) or (cars, 5) array
-        Inputs from lookahead_inputs().
-    xp : module
-        numpy or jax.numpy module; the same code runs in the ROS driver
-        (numpy) and in training (JAX). (Unused: `@` works for both.)
-
-    Returns
-    -------
-    float or (cars,) array
-        Lookahead distance L [m], not yet clipped.
+    s may be (5,) for one car or (cars, 5) for many. Not clipped: the caller
+    clips L to LOOKAHEAD_RANGE.
     """
     return s @ policy['w'] + policy['b']
 
 
-def gaussian_log_prob(action, mean, log_std, xp=np):
-    """Log of how likely `action` is under a bell curve centred on `mean`.
-
-    The bell curve is a normal distribution with spread (standard
-    deviation) exp(log_std). During training the policy picks L at random
-    from that bell curve, so it tries lookaheads it would not otherwise;
-    this says how likely each was.
-
-    Parameters
-    ----------
-    action : float or array
-        The value that was picked.
-    mean : float or array, same shape as `action`
-        Centre of the bell curve.
-    log_std : float
-        Log of the spread.
-    xp : module
-        numpy or jax.numpy module; the same code runs in the ROS driver
-        (numpy) and in training (JAX).
-
-    Returns
-    -------
-    float or array, same shape as `action`
-        Log of the probability density.
-    """
+def gaussian_log_prob(action: Array, mean: Array, log_std: float, xp=np) -> Array:
+    """Log-probability of `action` under a normal distribution (mean, spread exp(log_std))."""
     z = (action - mean) * xp.exp(-log_std)
     return -0.5 * (z * z + 2.0 * log_std + xp.log(2.0 * xp.pi))
 
 
-def ppo_policy_loss(log_prob, old_log_prob, advantage, log_std, clip, entropy_coef, xp=np,
-                    weight=None):
-    """PPO's loss for the policy: a number that gets smaller as the policy improves.
+def ppo_policy_loss(log_prob: Array, old_log_prob: Array, advantage: Array, log_std: float | Array,
+                    clip: float, entropy_coef: float, xp=np,
+                    weight: Array | None = None) -> tuple[float, float]:
+    """PPO's clipped policy loss (paper eq. 24-25, no critic term); returns (loss, kl).
 
-    PPO's loss for the policy (paper eq. 24 and 25, without the critic's
-    part, which belongs to training). Gradient descent makes it smaller.
-
-    ratio     how much more (> 1) or less (< 1) likely the policy now is to
-              pick the action it picked while driving
-    advantage how much better (> 0) or worse (< 0) than expected that action
-              turned out (training/train.py works it out)
-    The loss is lower when good actions become more likely and bad ones less
-    likely, but the ratio is clipped to 1 +- clip, so one update can only
-    change the policy a little: the "proximal" in PPO. The entropy term
-    (how random the policy is) rewards keeping some randomness, so the
-    policy keeps exploring.
-
-    Parameters
-    ----------
-    log_prob : (samples,) array
-        Log-probability of each action under the current policy.
-    old_log_prob : (samples,) array
-        Log-probability of the same actions when they were picked.
-    advantage : (samples,) array
-        How much better than expected each action turned out.
-    log_std : float or array
-        Log of the exploration spread (for the entropy term).
-    clip : float
-        How far the ratio may move from 1.
-    entropy_coef : float
-        Weight of the entropy bonus.
-    xp : module
-        numpy or jax.numpy module; the same code runs in the ROS driver
-        (numpy) and in training (JAX).
-    weight : (samples,) array, optional
-        One per sample: 1 if it counts, 0 if it does not (the speed table
-        only learns from cars inside the stretch being tuned). Leave it out
-        and every sample counts.
-
-    Returns
-    -------
-    loss : float
-        The loss to minimise.
-    kl : float
-        KL divergence estimate: how far the policy has moved. Training
-        stops an update early if it moves too far.
+    `weight` (1 or 0 per sample) leaves samples out of the averages; None counts
+    them all. kl estimates how far the policy moved since the samples were taken.
     """
     if weight is None:
         average = xp.mean
@@ -228,59 +84,20 @@ def ppo_policy_loss(log_prob, old_log_prob, advantage, log_std, clip, entropy_co
     return -surrogate - entropy_coef * entropy, kl
 
 
-def lookahead_loss(policy, log_std, s, chosen, old_log_prob, advantage, clip, entropy_coef, xp=np):
-    """The loss for the dynamic-lookahead policy, for a batch of samples.
+def lookahead_loss(policy: dict, log_std: float, s: Array, chosen: Array, old_log_prob: Array,
+                   advantage: Array, clip: float, entropy_coef: float,
+                   xp=np) -> tuple[float, float]:
+    """PPO loss of the lookahead policy over a batch of samples; returns (loss, kl).
 
-    How likely would the policy, with its current weights, be to make the same
-    picks? Feed that into PPO's loss. The gradient of this loss with respect
-    to w and b says how to change each weight.
-
-    Parameters
-    ----------
-    policy : dict
-        {'w': the 5 weights, 'b': the bias}: what training changes.
-    log_std : float
-        Log of the exploration spread [m]: training changes it too.
-    s : (samples, 5) array
-        The inputs v, |k0|, |k1|, |k2|, dk the car saw.
-    chosen : (samples,) array
-        The lookahead it picked [m], noise included, before clipping.
-    old_log_prob : (samples,) array
-        How likely that pick was when it was made.
-    advantage : (samples,) array
-        How much better than expected it went.
-    clip, entropy_coef : float
-        Passed to ppo_policy_loss().
-    xp : module
-        numpy or jax.numpy module; the same code runs in the ROS driver
-        (numpy) and in training (JAX).
-
-    Returns
-    -------
-    loss : float
-    kl : float
-        As ppo_policy_loss().
+    `chosen` is the L each car picked [m], noise included, before clipping.
     """
     mean = lookahead(policy, s, xp)
     log_prob = gaussian_log_prob(chosen, mean, log_std, xp)
     return ppo_policy_loss(log_prob, old_log_prob, advantage, log_std, clip, entropy_coef, xp)
 
 
-def load_lookahead(path):
-    """Read a lookahead.npz written by training/train.py (numpy only).
-
-    Parameters
-    ----------
-    path : str
-        Path to lookahead.npz.
-
-    Returns
-    -------
-    policy : dict
-        {'w': (5,) array, 'b': float}: the weights, for lookahead().
-    base_params : dict
-        The pure pursuit tuning it was trained with.
-    """
+def load_lookahead(path: str) -> tuple[dict, dict]:
+    """Read lookahead.npz from training/train.py: (policy, pure pursuit params it trained with)."""
     data = np.load(path)
     policy = {'w': data['w'], 'b': float(data['b'])}
     base_params = dict(zip(data['base_param_names'].tolist(),
@@ -288,107 +105,36 @@ def load_lookahead(path):
     return policy, base_params
 
 
-# ======================================================================
-# 2. Speed table: one learned speed per racing-line point
-# ======================================================================
-#
-# The policy is the table itself: `speeds`, one number per point, read off
-# at the point nearest the car (exactly like pure_pursuit's speed_table
-# argument). Training starts from raceline.speed_table and lets PPO move
-# each number; training/train.py --method speed_table explains how.
+# ---- 2. Speed table: one PPO-tuned speed per racing-line point ----
+# The policy is the table itself, read at the point nearest the car.
+# Training starts it from raceline.speed_table.
 
-
-def speed_table_inputs(curvature, nearest, speed, xp=np):
-    """What the critic sees for one car (training only).
-
-    The critic is the second network PPO trains: it guesses how well
-    things will go from here, so the advantage can be measured against it.
-    The table itself needs no inputs. The critic gets the 5 lookahead
-    inputs, plus where on the lap the car is, as a point on a circle
-    (sin, cos) so the end of the lap sits next to the start.
-
-    Parameters
-    ----------
-    curvature : (N,) array
-        Curvature of the racing line at each point [1/m].
-    nearest : int
-        Index of the path point closest to the car.
-    speed : float
-        The car's speed [m/s].
-    xp : module
-        numpy or jax.numpy module; the same code runs in the ROS driver
-        (numpy) and in training (JAX).
-
-    Returns
-    -------
-    (7,) array
-        v, |k0|, |k1|, |k2|, dk, sin(lap angle), cos(lap angle).
-    """
+def speed_table_inputs(curvature: Array, nearest: int, speed: MetresPerSecond, xp=np) -> Array:
+    """The critic's 7 inputs for one car: the 5 lookahead inputs, then sin, cos of lap position."""
     n = curvature.shape[0]
     angle = 2.0 * xp.pi * nearest / n
     return xp.concatenate([lookahead_inputs(curvature, nearest, speed, xp),
                            xp.stack([xp.sin(angle), xp.cos(angle)])])
 
 
-def speed_table_loss(speeds, log_std, point, chosen, old_log_prob, advantage, weight,
-                     clip, entropy_coef, xp=np):
-    """The loss for the speed table, for a batch of samples.
+def speed_table_loss(speeds: Array, log_std: float, point: Array, chosen: Array,
+                     old_log_prob: Array, advantage: Array, weight: Array,
+                     clip: float, entropy_coef: float, xp=np) -> tuple[float, float]:
+    """PPO loss of the speed table over a batch of samples; returns (loss, kl).
 
-    The table's speed at `point` is the centre of the bell curve the speed
-    was drawn from, so the gradient lands only on the points that were
-    driven past: each speed learns from the cars that used it.
-
-    Parameters
-    ----------
-    speeds : (points,) array
-        The table [m/s]: what training changes.
-    log_std : float
-        Log of the exploration spread [m/s]. Fixed: training stops its
-        gradient, because when learned it shrank to almost nothing.
-    point : (samples,) int array
-        The path point the car was nearest to.
-    chosen : (samples,) array
-        The speed it was sent [m/s], noise included.
-    old_log_prob : (samples,) array
-        How likely that speed was when it was sent.
-    advantage : (samples,) array
-        How much better than expected it went.
-    weight : (samples,) array
-        1 for cars inside the stretch being tuned, else 0.
-    clip, entropy_coef : float
-        Passed to ppo_policy_loss().
-    xp : module
-        numpy or jax.numpy module; the same code runs in the ROS driver
-        (numpy) and in training (JAX).
-
-    Returns
-    -------
-    loss : float
-    kl : float
-        As ppo_policy_loss().
+    Only speeds[point] get a gradient, so each speed learns from the cars that
+    drove past it. `weight` is 1 for cars inside the stretch being tuned, else 0.
     """
     log_prob = gaussian_log_prob(chosen, speeds[point], log_std, xp)
     return ppo_policy_loss(log_prob, old_log_prob, advantage, log_std, clip, entropy_coef,
                            xp, weight)
 
 
-def load_speed_table(path):
-    """Read a speed_table.npz written by training/train.py (numpy only).
+def load_speed_table(path: str) -> tuple[Array, Array, dict]:
+    """Read speed_table.npz from training/train.py: (speeds [m/s], line, params it trained with).
 
-    Parameters
-    ----------
-    path : str
-        Path to speed_table.npz.
-
-    Returns
-    -------
-    speeds : (N,) array
-        One speed per racing-line point [m/s].
-    line : (N, 2) array
-        The racing line it was tuned on [m] (the driver checks it is still
-        the same line).
-    base_params : dict
-        The pure pursuit tuning it was trained with.
+    `line` is the racing line it was tuned on: the driver rejects the table if
+    its own line differs.
     """
     data = np.load(path)
     base_params = dict(zip(data['base_param_names'].tolist(),

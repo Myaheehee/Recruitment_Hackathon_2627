@@ -179,18 +179,27 @@ there but is unused.
   submodule).
 - **Image operations:** `scipy.ndimage` (`binary_closing`,
   `distance_transform_edt`, `map_coordinates`).
+- **AI-written code:** much of the code was written with Claude Code
+  (Anthropic). See [AI assistance](#ai-assistance) for which parts.
 
 ## AI assistance
-We used **Claude Code** (Anthropic) throughout for:
-- implementing and refactoring the driver modules and the JAX training code
-  to our design
-- writing tests (`training/test_parity.py`)
-- tuning experiments
-- documentation, including the docstrings and `team_docs/`
+We used **Claude Code** (Anthropic's coding agent, run in VS Code and the
+terminal) throughout the project, as rule 36 permits. What it did, by part:
 
-The design decisions, experiments and their evaluation were ours. Every member
-has studied the code through `team_docs/` so that any of us can explain any
-part of it.
+| Part | Files | What Claude Code did |
+| --- | --- | --- |
+| Racing line | `raceline.py` | Implemented the clearance map, the cone sealing and the minimum-bending line optimiser to our design, and checked the geometry in the container without starting the simulator. |
+| Pure pursuit and speed | `pure_pursuit.py`, `driver.py` | Implemented and refactored pure pursuit, the physics speed table (cornering limit plus braking passes) and the ROS node around them. |
+| Learned policies | `policies.py` | Wrote the loaders for the tuned speed table and the lookahead policy, the line-match safety check and the fallback to the physics table. It also built the residual network we later dropped (`unused/residual/`). |
+| Training | `training/train.py`, `sim.py`, `evaluate.py`, `speed_table.py` | Wrote the JAX PPO code and the simulator wrapper that matches the race, and helped run and read the tuning experiments. |
+| Tests | `training/test_parity.py` | Wrote the tests that check the training code (JAX) and the driver (numpy) compute the same steering, lookahead and table speed, and that the speed table keeps to its braking and cornering limits. |
+| Documentation | docstrings, `team_docs/`, `training/README.md`, this file | Drafted the explanations of the code and maths, and `team_docs/check_links.py`, which keeps the doc links pointing at the right lines. |
+| Debugging | — | Helped track down build and environment problems (e.g. `verify_judging_env.sh` failing inside the container when run from a git worktree). |
+
+We made the design decisions (racing line plus pure pursuit, using RL only to
+tune parts of a controller that already worked, dropping the residual
+network), chose and ran the experiments, and judged the results on the
+official referee. 
 
 TODO: list any other tools (ChatGPT, Copilot, …) and what they were used for.
 

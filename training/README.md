@@ -172,7 +172,7 @@ The key trick: pure pursuit, the policy inputs and the policies are written
 
 | File | What it does |
 | --- | --- |
-| [`../race_ws/src/team_driver/team_driver/pure_pursuit.py`](../race_ws/src/team_driver/team_driver/pure_pursuit.py) | The controller and its race settings ([`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31)). Used by the driver **and** by training. |
+| [`../race_ws/src/team_driver/team_driver/pure_pursuit.py`](../race_ws/src/team_driver/team_driver/pure_pursuit.py) | The controller and its race settings ([`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16)). Used by the driver **and** by training. |
 | [`../race_ws/src/team_driver/team_driver/raceline.py`](../race_ws/src/team_driver/team_driver/raceline.py) | Builds the racing line from the map, and the starting speed table (`speed_table`, `limit_speed_changes`, `lap_time`). |
 | [`../race_ws/src/team_driver/team_driver/policies.py`](../race_ws/src/team_driver/team_driver/policies.py) | Both policies: their inputs, the policy functions, PPO's loss, and the loaders the driver uses. |
 | `../race_ws/src/team_driver/models/*.npz` | The trained files the driver loads. Absent = hand-made rule. |
@@ -244,7 +244,7 @@ equation on the second line (still close to `0.25·v`).
 `evaluate.py` prints, for each delay, laps driven, best timed lap, the 10-lap
 total, and wall contacts. A policy worth shipping is clean at every delay.
 Note: without `--speed-table`, `evaluate.py` uses the *untuned* table built
-from [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31), not `models/speed_table.npz`.
+from [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16), not `models/speed_table.npz`.
 
 To put a new policy in the car:
 
@@ -259,7 +259,7 @@ cd /hackathon/race_ws && colcon build --symlink-install && source install/local_
 At startup the driver logs `lookahead policy loaded from ...: L = ...`
 and `speed table tuned, from ..., scaled by 1.0: ...`. With no lookahead policy it
 logs `no trained lookahead policy: lookahead_gain * speed`. It also warns `pure pursuit
-settings changed since the policy was trained: [...]` if [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31) differ
+settings changed since the policy was trained: [...]` if [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16) differ
 from those saved in the file. The shipped files were saved before
 `table_scale` and `speed_lead` existed, so expect that warning to list
 those two; both are at their neutral values (1.0 and 0.0), so it is harmless.
@@ -280,26 +280,26 @@ builds it from two rules, with no top speed:
 2. Neighbours: between points `d` metres apart, speed changes by at most
    `2 · a_brake · d / (v + v_next)`, i.e. `v_next² ≤ v² + 2·a_brake·d`, the
    physics of braking/accelerating at `a_brake` (6.05 m/s²).
-   ([`limit_speed_changes()`](../race_ws/src/team_driver/team_driver/raceline.py#L275) in [raceline.py](../race_ws/src/team_driver/team_driver/raceline.py))
+   ([`limit_speed_changes()`](../race_ws/src/team_driver/team_driver/raceline.py#L120) in [raceline.py](../race_ws/src/team_driver/team_driver/raceline.py))
 
-With today's [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31) that table laps in 13.51 s if driven exactly.
+With today's [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16) that table laps in 13.51 s if driven exactly.
 
 **How PPO tunes 380 numbers.** Changing all 380 at once gives a signal too
 noisy to learn from, so each update:
 
-- Picks a random stretch of [`WINDOW`](train.py#L146) = 60 consecutive points (12 m).
+- Picks a random stretch of [`WINDOW`](train.py#L44) = 60 consecutive points (12 m).
 - Only cars inside the stretch explore. Each gets one random speed offset
-  (spread 0.3 m/s) per [`NOISE_SEGMENT`](train.py#L147) = 10 points (2 m), **held** for the
+  (spread 0.3 m/s) per [`NOISE_SEGMENT`](train.py#L45) = 10 points (2 m), **held** for the
   whole update. Why held: the simulated car eases towards its speed command,
   so a change lasting one 0.01 s step barely does anything; one held for 2 m does.
 - Cars elsewhere drive the table as it is. About 1 car in 6 is inside the
   window (`inside` ≈ 0.12–0.19 in the logs).
 - Only the stretch's samples count in the policy loss
-  ([`speed_table_loss()`](../race_ws/src/team_driver/team_driver/policies.py#L333) in [policies.py](../race_ws/src/team_driver/team_driver/policies.py),
+  ([`speed_table_loss()`](../race_ws/src/team_driver/team_driver/policies.py#L120) in [policies.py](../race_ws/src/team_driver/team_driver/policies.py),
   PPO's loss with a `weight`), and only its 60 speeds may change. The
   critic (7 inputs: the 5 lookahead inputs + where on the lap, as sin/cos)
   learns from every car.
-- After each update the table is clipped to [`SPEED_RANGE`](train.py#L148) (1–15 m/s) and
+- After each update the table is clipped to [`SPEED_RANGE`](train.py#L46) (1–15 m/s) and
   lowered wherever neighbours break rule 2 (`train.keep_within_rule`), so
   the tuned table obeys the same physics it started with.
 - Reward: the simulator's own, metres of progress per step, −10 for a wall.
@@ -356,7 +356,7 @@ L = b + w_v·v + w_0·|k0| + w_1·|k1| + w_2·|k2| + w_d·dk        clipped to 0
 | `dk` | `\|k1\| − \|k0\|`: is the bend tightening (+) or opening (−)? |
 
 It is **linear** (5 weights + bias), so after training you can read off what
-it learned. Training starts from `L = 0.25·v` ([`START_WEIGHTS`](../race_ws/src/team_driver/team_driver/policies.py#L87) in [policies.py](../race_ws/src/team_driver/team_driver/policies.py)),
+it learned. Training starts from `L = 0.25·v` ([`START_WEIGHTS`](../race_ws/src/team_driver/team_driver/policies.py#L41) in [policies.py](../race_ws/src/team_driver/team_driver/policies.py)),
 the hand rule. During training L gets ±0.3 m of Gaussian noise; the spread
 is learned too.
 
@@ -380,7 +380,7 @@ curvature terms; the paper does not give its curvature horizons, so 1 m and
 reaction delay (section 10). The PPO settings are the paper's (section III-J):
 discount 0.99, GAE λ 0.98, 5 epochs, clip 0.2, target KL 0.015, entropy 0.02,
 value weight 0.6, learning rate 2.3927e-4 falling linearly to 0
-([`SETTINGS`](train.py#L152) in [train.py](train.py)).
+([`SETTINGS`](train.py#L50) in [train.py](train.py)).
 
 Training prints the equation every 5 updates and the mean L on straight
 (`L straight`) and curved (`L curve`) track. The paper finds L grows on
@@ -398,7 +398,7 @@ One update (`update()` in [train.py](train.py)), with the default lookahead numb
 1. **Drive** 128 steps × 2048 cars = 262,144 samples. Each sample keeps what
    the policy saw, what it picked (noise included), how likely that pick
    was (`log_prob`), the critic's guess, and the reward.
-2. **Advantages with GAE** ([`advantages_and_returns()`](train.py#L359) in [train.py](train.py)). For
+2. **Advantages with GAE** ([`advantages_and_returns()`](train.py#L136) in [train.py](train.py)). For
    each step, `delta = reward + gamma · V(next) − V(now)`: one step of
    "better than expected?". GAE adds up later deltas, each shrunk by
    `gamma · lambda` per step. A crash gets no future value; hitting the 30 s
@@ -406,11 +406,11 @@ One update (`update()` in [train.py](train.py)), with the default lookahead numb
    rescaled to mean 0, spread 1.
 3. **Learn.** 5 passes (epochs) over the samples, each split into 32
    shuffled minibatches of 8,192: up to 160 gradient steps.
-   - Loss = PPO policy loss ([`ppo_policy_loss()`](../race_ws/src/team_driver/team_driver/policies.py#L172) in [policies.py](../race_ws/src/team_driver/team_driver/policies.py))
+   - Loss = PPO policy loss ([`ppo_policy_loss()`](../race_ws/src/team_driver/team_driver/policies.py#L67) in [policies.py](../race_ws/src/team_driver/team_driver/policies.py))
      + 0.6 × the critic's squared error − entropy bonus.
-   - Gradients longer than 0.5 are shrunk ([`clip_by_global_norm()`](train.py#L502) in [train.py](train.py)),
+   - Gradients longer than 0.5 are shrunk ([`clip_by_global_norm()`](train.py#L188) in [train.py](train.py)),
      so one bad minibatch cannot throw the weights far.
-   - **Adam** ([`adam_step()`](train.py#L456) in [train.py](train.py)) takes the step: it keeps running
+   - **Adam** ([`adam_step()`](train.py#L175) in [train.py](train.py)) takes the step: it keeps running
      averages of the gradient and its square, so every weight moves about
      `lr` per step whether its gradient is huge or tiny.
    - The learning rate falls in a straight line to 0 over the run.
@@ -418,6 +418,50 @@ One update (`update()` in [train.py](train.py)), with the default lookahead numb
      (`one_minibatch()` inside `update()` in [train.py](train.py)).
 4. Log, print every 5 updates, save every 20 updates and at the end
    (so a stopped run still leaves usable weights).
+
+
+### Inside `train.py`
+
+The code keeps one-line docstrings and type hints; these are the details
+behind it.
+
+- **Words.** A *rollout* is the driving between two updates (every car drives
+  `--rollout`, 128, steps and every step is kept). The *return* is advantage +
+  value: what the critic should have predicted, and what it is trained towards.
+  An *epoch* is one pass over a rollout's data, in `--minibatches` random pieces.
+- **JAX.** `jax.jit` compiles a function once so later calls run fast;
+  `jax.vmap` turns a one-car function into an all-cars one; `jax.lax.scan` runs
+  a loop inside compiled code, passing a *carry* (the values the loop updates)
+  from step to step.
+- **One compiled program per update.** Drive, score, learn and measure are a
+  single `jax.jit` function, so Python steps in once per update; the first call
+  compiles (a minute or two). The runner passed in is *donated*: its GPU memory
+  is reused for the result, so the old runner must never be used again.
+  `main()` sets `sim.MAX_DELAY` from `--max-delay` *before* building it, because
+  the delay queue's shape depends on it.
+- **GAE, written out.** `delta[t] = reward + gamma · V(after) − V(before)` and
+  `advantage[t] = delta[t] + gamma · lambda · advantage[t+1]`. That runs
+  backwards in time, so the scan goes over the reversed arrays. The sum stops
+  at an episode end, because the car's next step belongs to a new episode.
+- **Adam, written out.** Plain gradient descent is `w ← w − lr · gradient`.
+  Adam keeps `m`, the average gradient (so minibatch noise cancels), and `v`,
+  the average squared gradient; dividing by √v makes each step about `lr`
+  long. b1 = 0.9 and b2 = 0.999 remember roughly the last 10 and 1000 steps.
+  Both averages start at zero, so early on they are divided by (1 − b^step):
+  the *bias correction*.
+- **The critic** has two hidden layers of 128 tanh neurons and one linear
+  output, its *value*, in reward units (mostly metres of progress). Its weights
+  start *orthogonal* (random, with the columns of each matrix at right angles),
+  which keeps signals a sensible size through the layers.
+- **Speed-table mask.** Points outside the update's window get no gradient,
+  but Adam's running average `m` would still move them, so after every Adam
+  step the speeds outside the window are put back.
+- **What `save()` writes.** Every `.npz` holds `log_std`, the critic
+  (`critic_W0` … `critic_b2`, so `--init` can continue), the `DEFAULTS` at
+  training time (so the driver warns when they change) and the run's settings
+  as JSON. The lookahead adds `w`, `b`, `input_names` and `lookahead_range`;
+  the speed table adds `speeds` [m/s], the `line` [m] it was tuned on and
+  `speed_range`.
 
 ---
 
@@ -447,11 +491,23 @@ the speed table), pure pursuit was on the edge in the hairpin near (5.1, 9.7):
 
 So `sim.delay_commands` ([sim.py](sim.py)) keeps a queue of each car's
 last commands and applies the one from `delay` steps ago. Every episode gets
-a random delay from 0 to `--max-delay` (default [`MAX_DELAY`](sim.py#L83) = 3 steps). The
+a random delay from 0 to `--max-delay` (default [`MAX_DELAY`](sim.py#L52) = 3 steps). The
 shipped runs used larger ranges (speed table 8 then 12, lookahead 10) to be
 safe against a slower reaction. `evaluate.py` races one car per delay and
 reports each separately. Not modelled: the delay changing within a lap, and
 the driver occasionally skipping a scan.
+
+Three details of [sim.py](sim.py):
+- **One scan per physics step.** The simulator gives the driver a scan every
+  0.01 s step, as the race did when measured on 2026-10-03 (rule 35 says
+  "roughly 40 Hz"; the measurement disagrees). The driver's log line
+  `reaction delay … gap` shows the real rate on any machine: gap 1 = a scan
+  answered every step.
+- **The delay queue starts as zeros**, so for its first `delay` steps a car is
+  told (steering 0, speed 0).
+- **Rear axle vs centre of mass.** The simulator tracks the centre of mass,
+  0.17 m ahead of the rear axle; the driver and odometry use the rear axle, so
+  `odometry()` steps back along the heading and `start_poses()` steps forward.
 
 ---
 
@@ -459,7 +515,7 @@ the driver occasionally skipping a scan.
 
 ### `train.py`
 
-Defaults marked "per method" come from [`SETTINGS`](train.py#L152) in [train.py](train.py)
+Defaults marked "per method" come from [`SETTINGS`](train.py#L50) in [train.py](train.py)
 (lookahead / speed_table).
 
 | Flag | Default | What it does |
@@ -482,7 +538,7 @@ Defaults marked "per method" come from [`SETTINGS`](train.py#L152) in [train.py]
 | `--episode-steps` | 3000 | time limit per episode (30 s) |
 | `--w-speed`, `--w-jerk`, `--w-stall` | 0.002, 0.01, 0.05 | lookahead reward terms (section 8) |
 | `--init FILE` | none | continue from a saved `.npz` of the same method (policy, critic and noise; Adam and the lr schedule restart). This is how runs are chained, e.g. 014155 → 021003. For `speed_table` it is also the only way to start from a tuned table. |
-| `--speed-table FILE` | built from [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31) | lookahead only: drive by this tuned table (must match the racing line). Ignored by `--method speed_table`. |
+| `--speed-table FILE` | built from [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16) | lookahead only: drive by this tuned table (must match the racing line). Ignored by `--method speed_table`. |
 | `--max-delay N` | 3 | each car's reaction delay is random in 0..N steps |
 | `--seed` | 0 | random seed |
 | `--device` | `gpu` | `gpu` or `cpu` |
@@ -493,7 +549,7 @@ Defaults marked "per method" come from [`SETTINGS`](train.py#L152) in [train.py]
 | Flag | Default | What it does |
 | --- | --- | --- |
 | `--lookahead FILE` | none | let this policy choose L |
-| `--speed-table FILE` | built from [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31) | drive by this tuned table, with or without `--lookahead` |
+| `--speed-table FILE` | built from [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16) | drive by this tuned table, with or without `--lookahead` |
 | `--max-delay N` | 3 | race one car per delay 0..N |
 | `--laps N` | 11 | laps to drive, the first is a warm-up (like the referee) |
 | `--max-time S` | 300 | give up after this many *simulated* seconds |
@@ -501,12 +557,12 @@ Defaults marked "per method" come from [`SETTINGS`](train.py#L152) in [train.py]
 
 ### `speed_table.py`
 
-`--mu` and `--a-brake` (default from [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31)): print and draw the
+`--mu` and `--a-brake` (default from [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16)): print and draw the
 untuned table those values give. Writes `speed_table.csv` and `speed_table.png`.
 
 ### `pure_pursuit.DEFAULTS` knobs that matter here
 
-[`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31) in [pure_pursuit.py](../race_ws/src/team_driver/team_driver/pure_pursuit.py) are
+[`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16) in [pure_pursuit.py](../race_ws/src/team_driver/team_driver/pure_pursuit.py) are
 the race settings and also ROS parameters (`-p name:=value`).
 
 | Knob | Value | Meaning |
@@ -517,9 +573,9 @@ the race settings and also ROS parameters (`-p name:=value`).
 | `mu`, `a_brake` | 1.0489, 6.05 | the starting table's cornering grip and braking |
 | `lookahead_gain`, `min_lookahead` | 0.25, 0.5 | the hand lookahead rule `L = max(0.5, 0.25·v)` |
 
-Constants in [train.py](train.py): [`COLLISION_PENALTY`](train.py#L140) 10,
-[`MAX_GRAD_NORM`](train.py#L141) 0.5, [`STALL_SPEED`](train.py#L142) 0.05 m/s,
-[`STALL_STEPS`](train.py#L143) 50, [`WINDOW`](train.py#L146) 60, [`NOISE_SEGMENT`](train.py#L147) 10, [`SPEED_RANGE`](train.py#L148) (1, 15).
+Constants in [train.py](train.py): [`COLLISION_PENALTY`](train.py#L38) 10,
+[`MAX_GRAD_NORM`](train.py#L39) 0.5, [`STALL_SPEED`](train.py#L40) 0.05 m/s,
+[`STALL_STEPS`](train.py#L41) 50, [`WINDOW`](train.py#L44) 60, [`NOISE_SEGMENT`](train.py#L45) 10, [`SPEED_RANGE`](train.py#L46) (1, 15).
 
 ---
 
@@ -577,7 +633,7 @@ cp training/runs/<run from step 3>/lookahead.npz race_ws/src/team_driver/models/
 ```
 
 Expect close, not identical, numbers: the seed is fixed (0) but GPU maths is
-not bit-for-bit repeatable, and [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31) have changed slightly since (the
+not bit-for-bit repeatable, and [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16) have changed slightly since (the
 shipped lookahead file records a since-removed `table_v_max` setting, and
 neither file knows `table_scale` or `speed_lead`).
 
@@ -606,9 +662,9 @@ neither file knows `table_scale` or `speed_lead`).
 If any check fails, a policy trained here would race a different controller
 from the one it learned with. Each prints the largest difference it found.
 
-1. **Moving the code changed nothing.** It fetches the original [`plan()`](../race_ws/src/team_driver/team_driver/driver.py#L533)
+1. **Moving the code changed nothing.** It fetches the original [`plan()`](../race_ws/src/team_driver/team_driver/driver.py#L230)
    from `driver.py` at commit `0c2a770` (with `git show`) and compares it
-   with [`pure_pursuit()`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L81) on 1000 random situations: must agree to 1e-9.
+   with [`pure_pursuit()`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L51) on 1000 random situations: must agree to 1e-9.
    **Needs git history**: it fails in a copy without `.git` or a shallow
    clone that lacks `0c2a770`.
 2. **numpy (driver) = JAX (training)** for pure pursuit's command, on 300
@@ -633,7 +689,7 @@ from the one it learned with. Each prints the largest difference it found.
 - **A tuned table is tied to its racing line.** Change `wall_gap`, the map or
   the line code and the driver refuses the table (and falls back to the
   built-in one).
-- **Retuning [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31) invalidates policies.** They learned with the old
+- **Retuning [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16) invalidates policies.** They learned with the old
   tuning; the driver warns. Retrain.
 - **Weak reward signal** (the lookahead result): small policy changes barely
   move "metres of progress", so PPO can sit still. Longer runs, more cars or
@@ -645,12 +701,12 @@ from the one it learned with. Each prints the largest difference it found.
 
 ## 16. Things to tune
 
-- Speed table: [`WINDOW`](train.py#L146), [`NOISE_SEGMENT`](train.py#L147), [`SPEED_RANGE`](train.py#L148) in `train.py`;
-  `mu`, `a_brake` in [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L31) (the starting table); `--max-delay`.
+- Speed table: [`WINDOW`](train.py#L44), [`NOISE_SEGMENT`](train.py#L45), [`SPEED_RANGE`](train.py#L46) in `train.py`;
+  `mu`, `a_brake` in [`DEFAULTS`](../race_ws/src/team_driver/team_driver/pure_pursuit.py#L16) (the starting table); `--max-delay`.
 - In the car without retraining: `table_scale` (slower, safer) and
   `speed_lead` (earlier braking/acceleration), e.g. `-p table_scale:=0.95`.
 - Lookahead: `--w-speed`, `--w-jerk`, `--w-stall`, `--steps`, `--envs`.
-- Everywhere: `--lr`, `--gamma`, `--entropy`; [`COLLISION_PENALTY`](train.py#L140) in `train.py`.
+- Everywhere: `--lr`, `--gamma`, `--entropy`; [`COLLISION_PENALTY`](train.py#L38) in `train.py`.
 - If you change anything in `pure_pursuit.DEFAULTS`, retrain.
 
 ---
